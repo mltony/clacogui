@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtualenvs
+.venv/
+.venv*/
+venv/
+env/
+
+# Runtime state (never check in -- may contain paths / creds)
+*.log
+.clacogui_config.json
+
+# Personal launcher (may embed CLACOGUI_FTP_PASSWORD in plain text)
+run_hidden.vbs
+clacogui.secrets.txt
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
