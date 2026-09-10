@@ -39,6 +39,30 @@ _KEY_FORWARDER_JS = """
   function act(name) {
     try { window.location.href = 'clacogui-action://' + name; } catch (e) {}
   }
+
+  // Edit-blocking for code-block textareas: they render as editable so
+  // the caret stays navigable (Edge WebView2 makes ``<textarea readonly>``
+  // non-navigable in accessibility mode), but any actual mutation is
+  // vetoed here.  ``beforeinput`` fires for keyboard typing; paste and
+  // drop paths get their own event handlers because ``beforeinput`` is
+  // spotty for those on WebView2.  Selection / copy / focus / arrow-key
+  // movement all reach the element normally.
+  function isBlocked(el) {
+    return el && el.tagName === 'TEXTAREA' && el.dataset && el.dataset.readonly === '1';
+  }
+  document.addEventListener('beforeinput', function(e) {
+    if (isBlocked(e.target)) { e.preventDefault(); }
+  }, true);
+  document.addEventListener('paste', function(e) {
+    if (isBlocked(e.target)) { e.preventDefault(); }
+  }, true);
+  document.addEventListener('drop', function(e) {
+    if (isBlocked(e.target)) { e.preventDefault(); }
+  }, true);
+  document.addEventListener('dragover', function(e) {
+    if (isBlocked(e.target)) { e.preventDefault(); }
+  }, true);
+
   document.addEventListener('keydown', function(e) {
     var k = e.key;
     if (k === 'F2') {
@@ -332,11 +356,16 @@ def _markdown_to_html(md: str) -> str:
 
 
 def _code_block_html(lang: str, code: str) -> str:
-    """Render one fenced code block as a read-only multi-line text box.
+    """Render one fenced code block as an edit-blocked multi-line text box.
 
-    The textarea is ``readonly`` so it can't be edited, but the caret still
-    lands in it and arrow-key navigation still works -- exactly what a
-    screen-reader user needs to read the block character by character.
+    The textarea stays *editable* at the HTML level so caret navigation
+    (arrow keys, Home / End, PageUp / PageDown, Ctrl+Home / Ctrl+End) all
+    work exactly as on a normal text field.  Modifications are blocked by
+    a global ``beforeinput`` handler in ``_KEY_FORWARDER_JS`` -- see there
+    for the JS side.  Setting HTML ``readonly`` was tried first, but on
+    ``wx.html2.WebView`` (Edge WebView2 on Windows) that makes the caret
+    non-navigable, which broke screen-reader users.
+
     The visible "Code block (lang):" caption above the box was removed on
     request; the ``aria-label`` still carries the language for
     accessibility.
@@ -352,5 +381,5 @@ def _code_block_html(lang: str, code: str) -> str:
     return (
         f'<textarea class="code-block" aria-label="{label_esc}" '
         f'rows="{rows}" cols="{cols}" spellcheck="false" '
-        f'wrap="off" readonly>{safe}</textarea>'
+        f'wrap="off" data-readonly="1">{safe}</textarea>'
     )

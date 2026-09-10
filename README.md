@@ -405,21 +405,29 @@ idempotent in claude's TUI so this is safe to spam: unlike Ctrl+C,
 which exits claude on the second hit, repeated Esc just cancels the
 current turn each time.
 
-### Uncommitted prompt dialog
+### Uncommitted text in claude's prompt
 
-The launcher refuses to overwrite text the user is already typing
-into claude's TUI.  If clacogui asks the launcher to deliver a
-message while claude's input box is non-empty, the launcher renames
-your envelope to `<id>.json.needs_decision` and clacogui pops an
-**Uncommitted prompt** dialog with two buttons:
+If clacogui asks the launcher to deliver a message while claude's
+input box is non-empty, **the launcher erases the prompt and delivers
+anyway**.  Your message always wins; anything half-typed in claude's
+TUI is discarded.
 
-- **Cancel (keep my message)** &ndash; the default.  The pending file
-  is removed and your message is restored to clacogui's send box so
-  you can retry later.
-- **Erase claude's prompt and send** &ndash; clacogui rewrites the
-  envelope with `force_clear: true` and renames it back to
-  `<id>.json`.  The launcher then sends a Ctrl+E + Ctrl+U + backspace
-  flood to clear claude's prompt before pasting your message.
+The erasure is `_ERASE_CYCLES` repetitions of Ctrl+E (end of line) +
+Ctrl+U (kill line) + Backspace (join with the line above), followed by
+a backspace flood of at least `_MIN_ERASE_BACKSPACES`.  The loop is
+what makes **multi-line** prompts work: Ctrl+U kills only the line the
+cursor is on, so a single Ctrl+E + Ctrl+U would leave the other lines
+behind and your message would be appended to them.  Backspace crosses
+newlines in claude's TUI, so the trailing flood keeps walking upward
+through anything the cycles didn't reach.  The flood is *not* sized
+from the user-buffer estimate alone -- that counter undercounts -- so
+it has a generous floor; backspacing past the start of an empty prompt
+is a no-op.
+
+The launcher does still wait out `_QUIET_AFTER_KEYSTROKE_SEC` (500 ms)
+since your last keystroke before erasing, so it won't yank the prompt
+out from under you mid-word.  It simply retries on the next 200 ms
+tick until you pause.
 
 The protocol files mutate visibly on disk so multiple GUIs (or future
 debugging) can observe the state machine:
@@ -428,8 +436,15 @@ debugging) can observe the state machine:
 | --- | --- |
 | `<id>.json` | Pending (gate not yet open) |
 | (gone) | Delivered |
-| `<id>.json.needs_decision` (with `reason`) | Launcher needs the user to decide |
 | `<id>.json.failed` (with `error`) | Permanent failure; clacogui surfaces the error and restores your text |
+
+`<id>.json.needs_decision` is a **retired** state.  Older launchers
+parked an envelope there and waited for clacogui to pop an
+"Uncommitted prompt" dialog; if nobody answered it -- GUI restarted,
+tab closed -- the file was orphaned and silently reaped an hour later,
+losing the message.  Current launchers never write it.  clacogui still
+recognises the suffix, so a current GUI keeps working against an old
+installed launcher; it auto-authorises the erasure instead of asking.
 
 The launcher only consumes envelopes whose `session_id` matches the
 one it discovered in `<.claude>/sessions/<claude-pid>.json`, so

@@ -76,6 +76,183 @@ STALE_CLAUDE_SESSION_AGE_SEC = 7 * 24 * 3600
 # launch until something deletes them.
 STALE_REQUEST_AGE_SEC = 360
 
+# Response files are deleted by the agent that was waiting on them.  If that
+# agent died first (killed shell, timeout) nobody ever collects its response,
+# so the directory grows without bound -- entries nearly three months old were
+# found in it.  A response is only meaningful to an agent that is still
+# blocked, and no agent blocks longer than ``STALE_REQUEST_AGE_SEC``, so
+# anything older than this is garbage.  Kept well above that bound anyway,
+# since deleting a response a live agent has not yet read would hang it until
+# its own timeout.
+STALE_RESPONSE_AGE_SEC = 3600
+
+# Outgoing send envelopes are consumed by the launcher, which deletes them.
+# Two ways they leak: the launcher parked one in a terminal state
+# (``.needs_decision`` waiting on a dialog that closed with the GUI,
+# ``.failed`` waiting on an error the user already saw), or no launcher was
+# running to consume a plain ``.json`` at all.  Terminal states are swept on
+# the shorter cutoff below; a bare ``.json`` gets ``STALE_OUTGOING_JSON_AGE_SEC``
+# because a live launcher may still deliver it, and deleting one out from under
+# a pending send makes ``handle_outgoing_snapshot`` report it as *sent*.
+STALE_OUTGOING_AGE_SEC = 3600
+STALE_OUTGOING_JSON_AGE_SEC = 6 * 3600
+
+# A request fetch that fails is retried on later polls (see
+# ``_fetch_request``).  Cap the attempts so a file that is corrupt rather than
+# merely half-written doesn't get re-read on every poll tick.
+MAX_REQUEST_FETCH_ATTEMPTS = 5
+
+# ---------------------------------------------------------------------------
+# Turn-scoped hexec grants
+# ---------------------------------------------------------------------------
+# ``hexec`` shells out to the host devapp, so Claude Code asks permission on
+# every single invocation.  During an iterate-on-a-test loop that is a dialog
+# per attempt.  The narrowest thing Claude Code itself can offer is
+# ``destination: "session"`` (see ``_PERMISSION_DESTINATION_LABELS``) -- the
+# whole session, persisted to settings.  A *turn* is narrower than anything
+# Claude models, but the GUI already answers every PermissionRequest itself, so
+# it can auto-allow a bounded set without writing a rule anywhere.
+#
+# A grant lives in memory only, is keyed by session_id, and dies at the end of
+# the turn that created it.  Expiry watches the ``sessions/*.json`` status map
+# that ``_poll_agent`` already reads -- so it costs no extra FTP round trips,
+# which matters given how saturated the single IO thread is.
+#
+# Two independent scopes, each its own button:
+#   ``subcommand`` -- only this hexec subcommand (``pbpytest``, ``bash``, ...).
+#                     Granting ``pbpython`` does NOT grant ``bash``; the other
+#                     subcommands are constrained entry points into a container
+#                     or a named service action, whereas ``bash`` is arbitrary
+#                     host execution.
+#   ``any``        -- any hexec invocation, ``bash`` included.  Deliberately
+#                     broad; that is what it is for.
+HEXEC_GRANT_SCOPES: frozenset = frozenset({"subcommand", "any"})
+
+# Belt-and-braces bounds, any one of which ends a grant.  The turn boundary is
+# the real signal; these cap the damage if status tracking ever wedges (e.g.
+# claude exits without updating its metadata file, so ``busy`` never clears).
+HEXEC_GRANT_MAX_AGE_SEC = 10 * 60
+HEXEC_GRANT_MAX_USES = 25
+
+# Session statuses that mean "this turn is still running", so a turn-scoped
+# grant must survive them.  ``busy`` is claude working; ``waiting`` is claude
+# blocked on a tool decision -- which is precisely what it reports while our
+# own permission dialog is up, i.e. the instant a grant is created.  Treating
+# ``waiting`` as turn-end killed every grant before it could answer anything
+# but the request that spawned it.  Anything not listed here (``idle``, an
+# unrecognised status, a vanished session) ends the grant: unknown states
+# resolve toward "ask the user again", never toward a longer-lived grant.
+HEXEC_TURN_ACTIVE_STATUSES: frozenset = frozenset({"busy", "waiting"})
+
+# Absolute path of the hexec client, used to decide whether a Bash command
+# contains a hexec invocation at all.  Matched against any token of the command
+# line, not just the first: ``cd repo && hexec pbpytest x`` is a shape worth
+# auto-allowing, and anchoring on argv[0] rejected it.
+HEXEC_PATHS: tuple[str, ...] = (
+    "~/.claude/hexec/hexec",
+    "$HOME/.claude/hexec/hexec",
+    "/home/amalykh/.claude/hexec/hexec",
+)
+
+# A token containing any of these can't be read as plain argv, so the scan for
+# the subcommand stops at it.  Only the tokens between the hexec path and the
+# subcommand are gated, so ``hexec; rm -rf /`` (no subcommand reached) still
+# falls through to a dialog while ``hexec pbpytest x 2>&1 | tail -5`` matches.
+#
+# Note what this does NOT gate: anything before the hexec path, and anything
+# after the subcommand.  Matching is deliberately by presence of a hexec
+# invocation anywhere in the command line -- ``cd repo && hexec pbpytest x`` is
+# the shape that motivated it -- which means a grant also covers the rest of
+# the line.  ``rm -rf ~/x && hexec bash ls`` matches a ``bash`` grant, and
+# ``hexec pbpytest x | sh`` auto-allows the ``sh``.  The turn scope, the 25-use
+# cap, and the 600s age cap are what bound the blast radius now, not this.
+#
+# Only actual command separators / redirections are listed.  Bare parentheses
+# and braces are deliberately absent: they are not separators, and
+# ``hexec pbpython -c 'print(1)'`` -- the single most common form there is --
+# would otherwise never be auto-allowable.
+_SHELL_METACHARS: tuple[str, ...] = (
+    ";", "&", "|", "\n", "\r", "`", "$(", ">", "<",
+)
+
+# ``hexec``'s own dispatch (see ~/.claude/hexec/hexec) parses the timeout flag
+# first, then treats the next token as the subcommand.  Mirror that here so the
+# scope we show the user is the scope hexec will actually act on.
+_HEXEC_TIMEOUT_FLAGS: frozenset = frozenset({"--timeout", "-t"})
+
+
+def _hexec_subcommand(command: str) -> Optional[str]:
+    """Return the hexec subcommand in ``command``, or ``None``.
+
+    ``None`` means "no hexec invocation we can read a subcommand off" and the
+    caller must fall back to a dialog.  That covers a command mentioning no
+    hexec path, a separator reached before the subcommand, and a trailing
+    ``hexec`` with no subcommand after it.
+
+    The hexec path is located anywhere in the token list, so a command that
+    only reaches hexec after a ``cd`` still parses.  Parsing deliberately does
+    not use ``shlex``: a command that needs real shell parsing is one whose
+    quoting we would not reproduce faithfully anyway.
+    """
+    if not isinstance(command, str):
+        return None
+    text = command.strip()
+    if not text:
+        return None
+    parts = text.split()
+    at = next(
+        (n for n, tok in enumerate(parts) if tok.strip("'\"") in HEXEC_PATHS),
+        None,
+    )
+    if at is None:
+        return None
+    rest = parts[at + 1:]
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if any(ch in tok for ch in _SHELL_METACHARS):
+            return None
+        if tok in _HEXEC_TIMEOUT_FLAGS:
+            # The value is skipped as a subcommand candidate but still has to
+            # be clean: it sits before the subcommand, so a separator in it
+            # (``--timeout '1; rm -rf /' pbpytest``) would otherwise be
+            # invisible to the scan.
+            if i + 1 < len(rest) and any(
+                ch in rest[i + 1] for ch in _SHELL_METACHARS
+            ):
+                return None
+            i += 2
+            continue
+        return tok
+    return None
+
+
+def _hexec_grant_matches(grant: dict, event: dict) -> bool:
+    """True if ``grant`` covers the tool call described by ``event``.
+
+    Only ``Bash`` calls are ever matched: hexec is a shell command, so a
+    grant must never satisfy a Read, Write, or MCP request that happens to
+    mention hexec in its arguments.
+    """
+    tool = event.get("tool_name") or event.get("toolName") or ""
+    if tool != "Bash":
+        return False
+    tool_input = event.get("tool_input") or event.get("toolInput") or {}
+    if not isinstance(tool_input, dict):
+        return False
+    sub = _hexec_subcommand(tool_input.get("command") or "")
+    if sub is None:
+        return False
+    if grant.get("scope") == "any":
+        return True
+    return sub == grant.get("subcommand")
+
+# How long an agent poll may appear to be in flight before its flag is force
+# cleared.  Matches the transcript poll's grace period: long enough that a slow
+# but healthy multi-directory FTP scan is never superseded, short enough that a
+# genuinely lost callback doesn't stall permission dialogs for long.
+AGENT_POLL_WATCHDOG_SEC = 30.0
+
 # Hook events that mean "Claude actually finished something the user is
 # waiting on" -- ring on these.  ``Notification`` is treated specially
 # (see ``_NOTIFICATION_DEDUP_SEC``).
@@ -1034,6 +1211,24 @@ class ConversationPanel(wx.Panel):
         self._poll_started_at: Optional[float] = None
         self._loading = False
         self._polling = False
+        # Poll jobs carry a generation number.  ``_polling`` is meant to keep
+        # only one read in flight, but the 30s watchdog below can clear it
+        # while the original job is still running (``submit_io`` has no
+        # cancellation), so two jobs for the same file do overlap in
+        # practice.  Both capture the same ``prev_sig`` and so read
+        # overlapping tails, and the consumed bytes used to be added to the
+        # signature twice -- pushing the stored offset past the real file
+        # size, which then wedges every later poll into a full download.
+        #
+        # Two things guard against that.  Results older than ``_applied_gen``
+        # are discarded, and only the newest submitted job
+        # (``_inflight_gen``) may clear ``_polling``.  That covers
+        # out-of-order landings; the in-order case (both jobs land, oldest
+        # first, neither technically stale) is caught in ``poll`` by checking
+        # a tail's base offset against the current one before applying it.
+        self._poll_gen = 0
+        self._inflight_gen = 0
+        self._applied_gen = 0
         # Assistant entry uuids already merged into a turn's response.  Used by
         # ``_apply_incremental`` to skip re-appending chunks if the byte offset
         # ever regresses and re-reads an overlapping tail (which otherwise
@@ -1345,6 +1540,11 @@ class ConversationPanel(wx.Panel):
             data, sig = result
             self._data = data
             self._signature = sig
+            # A full (re)load supersedes any poll still in flight: those
+            # callbacks captured a pre-load ``prev_sig`` and would rewind
+            # the signature we just established.
+            self._poll_gen += 1
+            self._applied_gen = self._poll_gen
             self._seen_assistant_uuids = set(data.assistant_uuids)
             self._refresh_list(preserve_selection=not initial)
             self._refresh_html()
@@ -1399,12 +1599,18 @@ class ConversationPanel(wx.Panel):
             # If we've been "polling" for unreasonably long, assume the
             # callback was lost (this should never happen but guard anyway)
             # and free the flag so we don't deadlock the panel forever.
+            #
+            # The old job cannot be cancelled, so it *will* still deliver a
+            # result built from a now-stale ``prev_sig``.  Bumping the
+            # generation below is what makes that result inert.
             stuck_for = time.monotonic() - (self._poll_started_at or 0.0)
             if self._poll_started_at is not None and stuck_for > 30.0:
                 log.warning(
-                    "Forcing polling flag clear for %s; stuck for %.1fs",
+                    "Forcing polling flag clear for %s; stuck for %.1fs "
+                    "(superseding gen %d)",
                     self.rel_path,
                     stuck_for,
+                    self._inflight_gen,
                 )
                 self._polling = False
             else:
@@ -1418,26 +1624,48 @@ class ConversationPanel(wx.Panel):
         # For incremental reads: if we have existing data and the previous
         # size is known, we can read only the new bytes.
         prev_size = prev_sig[1] if prev_sig else 0
+        self._poll_gen += 1
+        gen = self._poll_gen
+        self._inflight_gen = gen
 
         def work():
             sig = file_signature(backend, rel_path)
             if sig is None or sig == prev_sig:
                 return (sig, None, None)  # nothing to re-parse
             new_size = sig[1]
+            # Size unchanged: mtime moved but there are no new bytes, so
+            # there is nothing to read.  ``stat()`` is not a snapshot on FTP
+            # (SIZE and MDTM are separate round trips against a file Claude
+            # is appending to), so this is the single most common outcome --
+            # it must not fall through to the full re-read below.
+            if new_size == prev_size:
+                return (sig, None, "")
             # Incremental: if file grew (append-only) and we have prior data,
             # read only the tail.
             if prev_size > 0 and new_size > prev_size:
                 tail_text = backend.read_text_from(rel_path, prev_size)
                 return (sig, None, tail_text)
-            # Full re-read (file shrank / first load / truncated).
+            # Full re-read: first load, or the stored offset is somehow ahead
+            # of the file, in which case reloading resets it to a real size.
             data = parse_conversation(backend, rel_path)
             return (sig, data, None)
 
         def callback(result, exc):
             if not self:
                 return
-            self._polling = False
-            self._poll_started_at = None
+            # Only the newest submitted job owns the flag; an older callback
+            # arriving late must not re-open the gate for a job that is
+            # still running.
+            if gen == self._inflight_gen:
+                self._polling = False
+                self._poll_started_at = None
+            if gen <= self._applied_gen:
+                log.debug(
+                    "Poll: discarding stale gen %d for %s (applied=%d)",
+                    gen, self.rel_path, self._applied_gen,
+                )
+                return
+            self._applied_gen = gen
             if exc is not None:
                 self._poll_failures += 1
                 if self._poll_failures % 30 == 1:
@@ -1466,8 +1694,24 @@ class ConversationPanel(wx.Panel):
             self._poll_quiet_count = 0
 
             if tail_text is not None:
+                # The tail starts at ``prev_size``, so it may only be applied
+                # if the panel is still sitting at that offset.  Two
+                # overlapping jobs capture the same ``prev_sig`` and therefore
+                # read overlapping tails; both land in increasing generation
+                # order, so the staleness check above does not catch the
+                # second one.  Applying it would count the overlap twice and
+                # push the offset past the real file size.  Dropping it loses
+                # nothing: the next poll reads from the updated offset.
+                cur_offset = self._signature[1] if self._signature else 0
+                if cur_offset != prev_size:
+                    log.debug(
+                        "Poll: dropping overlapping tail for %s "
+                        "(read from %d, panel now at %d)",
+                        self.rel_path, prev_size, cur_offset,
+                    )
+                    return
                 # Incremental update: parse only the new lines.
-                self._apply_incremental(tail_text, sig)
+                self._apply_incremental(tail_text, sig, prev_size)
                 return
 
             if data is None:
@@ -1477,6 +1721,18 @@ class ConversationPanel(wx.Panel):
                 )
                 return
 
+            # Reaching here means either a first load or a stored offset that
+            # is ahead of the file.  The latter used to be routine (two
+            # overlapping jobs each adding their consumed bytes to the same
+            # base, wedging the panel into a full download every tick); the
+            # generation guard should make it unreachable, so log it loudly
+            # enough to notice if it ever comes back.
+            if prev_size > sig[1]:
+                log.warning(
+                    "Poll: %s stored offset %d is ahead of file size %d; "
+                    "falling back to full reload",
+                    self.rel_path, prev_size, sig[1],
+                )
             log.info(
                 "Poll: %s full reload prev=%r new=%r turns=%d",
                 self.rel_path, prev_sig, sig, len(data.turns),
@@ -1486,6 +1742,9 @@ class ConversationPanel(wx.Panel):
             old_name = self._data.name
             old_selection = self.list_box.GetSelection()
             self._data = data
+            # ``parse_conversation`` consumed the whole file as it stood when
+            # the read started, so the true resume offset is that read's stat
+            # size -- which is what ``sig`` holds.
             self._signature = sig
             self._seen_assistant_uuids = set(data.assistant_uuids)
 
@@ -1504,8 +1763,17 @@ class ConversationPanel(wx.Panel):
 
         submit_io(work, callback)
 
-    def _apply_incremental(self, tail_text: str, sig: tuple[float, int]) -> None:
-        """Parse appended JSONL lines and merge into existing conversation data."""
+    def _apply_incremental(
+        self, tail_text: str, sig: tuple[float, int], base_offset: int
+    ) -> None:
+        """Parse appended JSONL lines and merge into existing conversation data.
+
+        ``base_offset`` is the byte offset the tail was read from.  The new
+        signature is computed from it rather than from ``self._signature``:
+        the two are normally equal, but reading the current signature here
+        would silently mis-account a tail whose base no longer matches (see
+        the overlap guard in ``poll``).
+        """
         from models import _extract_user_text, _extract_assistant_text
 
         old_count = len(self._data.turns)
@@ -1520,7 +1788,7 @@ class ConversationPanel(wx.Panel):
         # overlap on the following poll -- that is what duplicates paragraphs
         # and whole messages.  Instead we track how many bytes we actually
         # consume and store that as the signature size.
-        prev_size = self._signature[1] if self._signature else 0
+        prev_size = base_offset
 
         # Only consume up to the last complete line.  The tail read can stop
         # mid-line while Claude is still writing a JSONL record; that partial
@@ -1725,6 +1993,25 @@ class ConversationPanel(wx.Panel):
         wx.PostEvent(self.GetParent(), evt)
 
     def _refresh_list(self, preserve_selection: bool = False) -> None:
+        """Sync the left-hand list_box with ``self._data.turns``.
+
+        Full ``list_box.Set(previews)`` is called on every poll tick when
+        naively implemented, which visibly flickers on some Windows themes
+        (``SetDoubleBuffered`` doesn't reliably suppress it for
+        ``wx.ListBox``).  We now do a *surgical* update instead:
+
+          * If the current list of previews matches what's in the list
+            box exactly, do nothing.  This is the hot path -- most poll
+            ticks find no user-visible change.
+          * If only the last row's *text* differs (typical when the
+            assistant streams more content into the currently-selected
+            turn), use ``SetString`` to rewrite just that row.
+          * If the *length* changed (a new user message arrived, or the
+            file was reloaded), fall through to the full ``Set``.
+
+        Only the full-Set path can flicker, and it now only fires when
+        the list genuinely gains or loses rows.
+        """
         prev_uuid: Optional[str] = None
         if preserve_selection:
             sel = self.list_box.GetSelection()
@@ -1732,8 +2019,28 @@ class ConversationPanel(wx.Panel):
                 prev_uuid = self._data.turns[sel].user_uuid
 
         previews = [t.preview(120) for t in self._data.turns]
-        # ``Set`` rebuilds the list in one shot, which is faster and avoids
-        # flicker that screen readers find irritating.
+        current_count = self.list_box.GetCount()
+
+        if current_count == len(previews):
+            # Same length -- compare row-by-row and touch only what's
+            # different.  In practice at most the last row differs
+            # (assistant is still streaming).
+            changed_indices: list[int] = []
+            for i, preview in enumerate(previews):
+                if self.list_box.GetString(i) != preview:
+                    changed_indices.append(i)
+            if not changed_indices:
+                # No visible change -- avoid all list-box mutation to
+                # eliminate any repaint at all this tick.
+                return
+            for i in changed_indices:
+                self.list_box.SetString(i, previews[i])
+            # Selection is preserved automatically by SetString; don't
+            # touch it (touching it can itself cause a repaint / scroll
+            # jump on some themes).
+            return
+
+        # Length changed: full rebuild is unavoidable.
         self.list_box.Set(previews)
 
         if not previews:
@@ -2058,6 +2365,18 @@ class ConversationPanel(wx.Panel):
             "force_clear": force_clear,
         }
         body = json.dumps(envelope, indent=2).encode("utf-8")
+
+        # Sending starts a new turn, which retires any hexec grant made
+        # during the previous one.  Doing it here rather than waiting for the
+        # status map to flip closes the window where the grant from turn N is
+        # still live while turn N+1's first tool call arrives.
+        top = wx.GetTopLevelParent(self)
+        clear_grants = getattr(top, "_clear_hexec_grants", None)
+        if callable(clear_grants):
+            try:
+                clear_grants("new message sent")
+            except Exception:
+                log.debug("_clear_hexec_grants crashed", exc_info=True)
 
         # Reserve the tracking slot before the IO so the very next
         # poll tick (which may happen on an unlucky schedule before
@@ -2417,18 +2736,18 @@ class ConversationPanel(wx.Panel):
             return
         rel_nd = f"{AGENT_OUTGOING_DIR}/{pid}.json.needs_decision"
         rel_json = f"{AGENT_OUTGOING_DIR}/{pid}.json"
-        try:
-            top = self.GetTopLevelParent()
-            dlg = UncommittedPromptDialog(top, reason)
-            try:
-                dlg.ShowModal()
-                choice = dlg.decision
-            finally:
-                dlg.Destroy()
-        finally:
-            info_again = self._pending_sends.get(pid)
-            if info_again is not None:
-                info_again["dialog_open"] = False
+        # Auto-answer "erase claude's prompt and send" instead of asking.
+        # A current launcher never parks an envelope this way any more --
+        # it erases and delivers in one step -- so reaching here means an
+        # older launcher is installed on the claude side.  Answer it the
+        # way the user always answered it, so a version skew between the
+        # GUI and the installed launcher can't strand a message behind a
+        # dialog.
+        log.info(
+            "Auto-authorising erase-and-send for %s (reason=%s)", pid, reason
+        )
+        choice = wx.ID_OK
+        info["dialog_open"] = False
 
         if choice == wx.ID_OK:
             # Erase-and-send: re-emit the envelope with force_clear and
@@ -2670,14 +2989,35 @@ class MainFrame(wx.Frame):
 
         # Agent (hook) monitoring state.
         self._agent_polling = False
+        # Watchdog + generation guard for the agent poll, mirroring
+        # ``ConversationPanel.poll``.  If an agent-poll callback is ever lost,
+        # ``_agent_polling`` would stay set forever and the GUI would stop
+        # noticing new permission requests entirely -- silently, since nothing
+        # else clears the flag.  The watchdog frees it; the generation numbers
+        # keep the superseded job's late result from being applied, because
+        # ``submit_io`` cannot cancel it.  (Adding a watchdog *without* the
+        # generation guard is what caused the transcript offset-drift bug.)
+        self._agent_poll_started_at: Optional[float] = None
+        self._agent_poll_gen = 0
+        self._agent_inflight_gen = 0
+        self._agent_applied_gen = 0
         self._seen_notifications: set[str] = set()
         self._seen_requests: set[str] = set()
+        # {request name: consecutive fetch failures}.  A failed fetch is
+        # retried by forgetting the name in ``_seen_requests``; this bounds
+        # that retry so an unreadable file can't be re-fetched every tick.
+        self._request_fetch_failures: dict[str, int] = {}
         # Permission-request dialogs are queued and shown one at a time
         # to prevent nested event loops from making the UI unresponsive.
         self._open_requests: set[str] = set()
         self._permission_queue: list[tuple[str, dict]] = []
         self._permission_dialog_active: bool = False
         self._current_permission_dialog: Optional[wx.Dialog] = None
+        # Turn-scoped hexec grants, keyed by claude session_id so a grant
+        # made in one tab can never satisfy a request from another.  In
+        # memory only -- nothing is persisted, so a GUI restart clears them.
+        # See the HEXEC_GRANT_* constants for the lifecycle.
+        self._hexec_grants: dict[str, dict] = {}
         # Track when we last rang for a "completion" event (Stop /
         # SubagentStop / PreToolUse).  Claude Code fires a follow-up
         # ``Notification`` ~60s after Stop ("waiting for your input"),
@@ -2703,7 +3043,7 @@ class MainFrame(wx.Frame):
         self._claude_session_names: dict[str, str] = {}
 
         self._update_status()
-        self._gc_stale_agent_requests()
+        self._gc_stale_agent_files()
         self.Bind(wx.EVT_ACTIVATE, self._on_activate)
 
     # -- Construction -------------------------------------------------------
@@ -3268,13 +3608,36 @@ class MainFrame(wx.Frame):
     def _poll_agent(self) -> None:
         """Look for new notification/request/outgoing files under the backend root.
 
-        Runs at most one scan in flight at a time.  All directories are
-        listed in a single backend hop because each FTP MLSD is round-trip
+        Runs at most one scan in flight at a time, subject to a watchdog so a
+        lost callback can't stop agent polling permanently.  All directories
+        are listed in a single backend hop because each FTP MLSD is round-trip
         heavy.
         """
-        if self.backend is None or self._agent_polling:
+        if self.backend is None:
             return
+        if self._agent_polling:
+            # A lost callback would otherwise wedge agent polling for the
+            # lifetime of the process, so no new permission request would ever
+            # be noticed.  Free the flag after the same grace period the
+            # transcript poll uses; the stranded job stays uncancellable, but
+            # the generation stamped below makes its late result inert.
+            stuck_for = time.monotonic() - (self._agent_poll_started_at or 0.0)
+            if (
+                self._agent_poll_started_at is not None
+                and stuck_for > AGENT_POLL_WATCHDOG_SEC
+            ):
+                log.warning(
+                    "Forcing agent-poll flag clear; stuck for %.1fs "
+                    "(superseding gen %d)",
+                    stuck_for, self._agent_inflight_gen,
+                )
+            else:
+                return
         self._agent_polling = True
+        self._agent_poll_started_at = time.monotonic()
+        self._agent_poll_gen += 1
+        gen = self._agent_poll_gen
+        self._agent_inflight_gen = gen
         backend = self.backend
 
         def work():
@@ -3317,11 +3680,26 @@ class MainFrame(wx.Frame):
         def callback(result, exc):
             if not self:
                 return
-            self._agent_polling = False
+            # Only the newest job owns the flag: an older callback arriving
+            # late must not re-open the gate while its successor still runs.
+            if gen == self._agent_inflight_gen:
+                self._agent_polling = False
+                self._agent_poll_started_at = None
+            if gen <= self._agent_applied_gen:
+                log.debug(
+                    "Agent poll: discarding stale gen %d (applied=%d)",
+                    gen, self._agent_applied_gen,
+                )
+                return
+            self._agent_applied_gen = gen
             if exc is not None:
                 # Common case: directories don't exist (agent not installed).
-                # Don't spam the log, just debug.
-                log.debug("Agent poll IO failed: %s", exc)
+                # Was previously log.debug; bumped to log.warning because a
+                # silent poll-IO failure means permission dialogs won't pop --
+                # exactly the case that stranded requests in the queue on
+                # 2026-07-15.  If the "agent not installed" case gets noisy,
+                # switch to logging only when the failure kind changes.
+                log.warning("Agent poll IO failed: %s", exc)
                 return
             (
                 notifications,
@@ -3330,11 +3708,24 @@ class MainFrame(wx.Frame):
                 claude_status_map,
                 claude_names_map,
             ) = result
+            # Debug breadcrumb so the file log always shows the poll ran.
+            # Distinguishes "poll never fired" from "poll fired but saw nothing".
+            log.debug(
+                "Agent poll ok: notif=%d req=%d outgoing=%d "
+                "(seen_notif=%d seen_req=%d open_req=%d)",
+                len(notifications), len(requests), len(outgoing),
+                len(self._seen_notifications), len(self._seen_requests),
+                len(self._open_requests),
+            )
             # Update claude session state first so the status bar
             # and tab titles reflect the freshest data even if the
             # other handlers below put up a transient message.
             self._claude_status_map = claude_status_map
             self._claude_session_names = claude_names_map
+            # Turn-scoped hexec grants expire off this same status map, so
+            # they must be reconciled before any request is answered from
+            # one -- otherwise a grant could outlive its turn by one poll.
+            self._expire_hexec_grants(claude_status_map)
             self._refresh_claude_status_field()
             self._push_session_aliases()
             self._handle_new_notifications(notifications)
@@ -3427,63 +3818,121 @@ class MainFrame(wx.Frame):
 
         submit_io_write(work, lambda _r, _e: None)
 
-    def _gc_stale_agent_requests(self) -> None:
-        """Delete request files older than :data:`STALE_REQUEST_AGE_SEC`.
+    def _collect_pending_send_ids(self) -> set[str]:
+        """Ids of sends any open tab is still tracking.
 
-        A live agent process always cleans up its own request file in
-        a ``finally``.  But if the agent (or its wrapping shell) was
-        killed while a permission dialog was open, the file is left
-        behind on disk -- and because the GUI scans
-        ``clacogui_requests/`` on every poll, that file would
-        resurrect the same prompt at every GUI launch forever.
+        Read on the wx main thread before the GC job is queued -- the
+        ``_pending_sends`` dicts belong to the panels and must not be touched
+        from the IO worker.
+        """
+        pending: set[str] = set()
+        for i in range(self.notebook.GetPageCount()):
+            page = self.notebook.GetPage(i)
+            if isinstance(page, ConversationPanel):
+                try:
+                    pending.update(page._pending_sends.keys())
+                except Exception:
+                    log.debug("could not read pending sends for page %d", i)
+        return pending
 
-        Anything older than the agent's request timeout is guaranteed
-        not to belong to a still-waiting agent, so we sweep it.
-        Backends that don't expose accurate mtimes will simply skip
-        the entry.
+    def _gc_stale_agent_files(self) -> None:
+        """Sweep agent protocol files that can no longer matter.
+
+        A live agent process always cleans up its own request file (and the
+        response it consumed) in a ``finally``.  But if the agent -- or its
+        wrapping shell -- was killed, both are left behind on disk:
+
+        * A stale **request** would resurrect the same prompt at every GUI
+          launch forever, because the GUI scans ``clacogui_requests/`` on
+          every poll.
+        * A stale **response** is inert but never collected, so
+          ``clacogui_responses/`` grows without bound.
+        * A stale **outgoing** envelope is one the launcher parked in a
+          terminal state (``.needs_decision``, ``.failed``) or never consumed
+          at all.  Inert like responses, but it shows up in the
+          ``outgoing=N`` count of every single agent poll.
+
+        Nothing swept here can belong to a still-live peer once it is older
+        than the relevant cutoff.  Backends that don't expose accurate mtimes
+        simply skip the entry.
+
+        Outgoing needs one extra guard the other directories don't: a bare
+        ``<id>.json`` may still be picked up by a running launcher, and
+        ``handle_outgoing_snapshot`` treats "file vanished" as *delivered*.
+        Deleting one would therefore report a message as sent that never was,
+        so pending ids are excluded outright and the rest wait out a longer
+        cutoff.
         """
         backend = self.backend
         if backend is None:
             return
-        cutoff = time.time() - STALE_REQUEST_AGE_SEC
+        now = time.time()
+        # (directory, cutoff, suffixes) -- responses and outgoing get a much
+        # longer grace period than requests since deleting one out from under
+        # a live peer would hang it (or silently drop a message).
+        targets = (
+            (AGENT_REQUESTS_DIR, now - STALE_REQUEST_AGE_SEC, (".json",)),
+            (AGENT_RESPONSES_DIR, now - STALE_RESPONSE_AGE_SEC, (".json",)),
+            (
+                AGENT_OUTGOING_DIR,
+                now - STALE_OUTGOING_AGE_SEC,
+                (".json.needs_decision", ".json.failed", ".json.part"),
+            ),
+            (
+                AGENT_OUTGOING_DIR,
+                now - STALE_OUTGOING_JSON_AGE_SEC,
+                (".json",),
+            ),
+        )
+        # Ids any open tab is still tracking.  Their files are owned by an
+        # in-flight send state machine, so they are never GC candidates no
+        # matter how old the mtime looks.
+        pending_ids = self._collect_pending_send_ids()
 
-        def work() -> list[str]:
-            try:
-                entries = backend.list_dir(AGENT_REQUESTS_DIR)
-            except FileNotFoundError:
-                return []
-            except OSError:
-                log.debug(
-                    "GC: list_dir(%s) failed", AGENT_REQUESTS_DIR, exc_info=True
-                )
-                return []
-            removed: list[str] = []
-            for e in entries:
-                if e.is_dir or not e.name.endswith(".json"):
-                    continue
-                if e.mtime <= 0 or e.mtime >= cutoff:
-                    continue
-                rel = f"{AGENT_REQUESTS_DIR}/{e.name}"
+        def work() -> list[tuple[str, list[str]]]:
+            swept: list[tuple[str, list[str]]] = []
+            for directory, cutoff, suffixes in targets:
                 try:
-                    backend.delete(rel)
-                    removed.append(e.name)
+                    entries = backend.list_dir(directory)
                 except FileNotFoundError:
-                    pass
+                    continue
                 except OSError:
-                    log.debug(
-                        "GC: could not delete stale request %s", rel,
-                        exc_info=True,
-                    )
-            return removed
+                    log.debug("GC: list_dir(%s) failed", directory, exc_info=True)
+                    continue
+                removed: list[str] = []
+                for e in entries:
+                    if e.is_dir or not e.name.endswith(suffixes):
+                        continue
+                    if e.mtime <= 0 or e.mtime >= cutoff:
+                        continue
+                    if (
+                        directory == AGENT_OUTGOING_DIR
+                        and _outgoing_pending_id(e.name) in pending_ids
+                    ):
+                        continue
+                    rel = f"{directory}/{e.name}"
+                    try:
+                        backend.delete(rel)
+                        removed.append(e.name)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        log.debug(
+                            "GC: could not delete stale entry %s", rel,
+                            exc_info=True,
+                        )
+                if removed:
+                    swept.append((directory, removed))
+            return swept
 
         def callback(result, exc):
             if exc is not None:
-                log.debug("Stale-request GC failed", exc_info=exc)
+                log.debug("Stale-file GC failed", exc_info=exc)
                 return
-            if result:
+            for directory, removed in result or ():
                 log.info(
-                    "Reaped %d stale clacogui_requests entries: %s",
-                    len(result), ", ".join(result),
+                    "Reaped %d stale %s entries: %s",
+                    len(removed), directory, ", ".join(removed),
                 )
 
         submit_io_write(work, callback)
@@ -3495,6 +3944,17 @@ class MainFrame(wx.Frame):
         any_new = False
         for name in names:
             if name in self._seen_requests or name in self._open_requests:
+                # If a request file is on disk but we've already recorded it
+                # as seen/open, no dialog will re-open for it -- and if the
+                # earlier open path failed silently, the request is stranded.
+                # Log at debug so we can spot the pattern without spamming
+                # every tick.
+                log.debug(
+                    "Skipping known request %s (in _seen=%s in _open=%s)",
+                    name,
+                    name in self._seen_requests,
+                    name in self._open_requests,
+                )
                 continue
             self._seen_requests.add(name)
             self._open_requests.add(name)
@@ -3520,33 +3980,225 @@ class MainFrame(wx.Frame):
         def work():
             return backend.read_text(rel)
 
+        def retry_or_give_up(reason: str) -> None:
+            """Forget ``name`` so a later poll re-offers it, up to a limit.
+
+            Rolling back ``_seen_requests`` (not just ``_open_requests``) is
+            what makes the failure recoverable: the agent is still blocked and
+            its request file is still on disk, but a name left in
+            ``_seen_requests`` is skipped by ``_handle_new_requests`` forever,
+            so no dialog ever appears and the agent waits out its full
+            timeout.  Retries are capped because polls run every
+            ``POLL_INTERVAL_MS`` -- a permanently unreadable file would
+            otherwise re-log on every tick until the GC sweeps it.
+            """
+            self._open_requests.discard(name)
+            fails = self._request_fetch_failures.get(name, 0) + 1
+            if fails >= MAX_REQUEST_FETCH_ATTEMPTS:
+                self._request_fetch_failures.pop(name, None)
+                log.error(
+                    "Giving up on request %s after %d attempts: %s",
+                    rel, fails, reason,
+                )
+                return
+            self._request_fetch_failures[name] = fails
+            self._seen_requests.discard(name)
+            log.warning(
+                "Could not use request %s: %s (attempt %d, retrying)",
+                rel, reason, fails,
+            )
+
         def callback(result, exc):
             if not self:
                 return
             if exc is not None:
-                log.warning("Could not read request %s: %s", rel, exc)
-                self._open_requests.discard(name)
+                retry_or_give_up(str(exc))
                 return
             try:
                 event = json.loads(result)
             except (ValueError, TypeError) as e:
-                log.warning("Bad JSON in request %s: %s", rel, e)
-                self._open_requests.discard(name)
+                # Retryable: the agent writes request files with a bare STOR
+                # on FTP (no temp+rename), so a read that races the write can
+                # see truncated JSON that is complete moments later.
+                retry_or_give_up(f"bad JSON: {e}")
                 return
+            self._request_fetch_failures.pop(name, None)
             self._show_permission_dialog(name, event)
 
         submit_io(work, callback)
 
+    # -- turn-scoped hexec grants ------------------------------------------
+
+    def _grant_hexec(self, event: dict, scope: str) -> None:
+        """Record a turn-scoped grant from the user's button click.
+
+        No-op without a ``session_id``: a grant that can't be scoped to a
+        session can't be expired by that session's status transitions
+        either, and an unexpirable grant is exactly what this must not be.
+        """
+        sid = event.get("session_id") or event.get("sessionId")
+        if not isinstance(sid, str) or not sid:
+            log.warning(
+                "hexec grant (%s) refused: request has no session_id", scope,
+            )
+            return
+        tool_input = event.get("tool_input") or event.get("toolInput") or {}
+        sub = _hexec_subcommand(
+            (tool_input or {}).get("command") or ""
+        ) if isinstance(tool_input, dict) else None
+        self._hexec_grants[sid] = {
+            "scope": scope,
+            "subcommand": sub,
+            "created": time.time(),
+            "uses": 0,
+            # The cached status is up to one poll interval stale, so at click
+            # time it may still read "idle" even though claude is about to
+            # run.  Expiring on idle before the grant has ever seen busy
+            # would kill it immediately; wait for busy to arm it first.
+            "armed": False,
+        }
+        log.info(
+            "hexec grant created: session=%s scope=%s subcommand=%s",
+            sid, scope, sub,
+        )
+
+    def _expire_hexec_grants(self, status_map: dict) -> None:
+        """Drop grants whose turn is over, or which hit a hard bound.
+
+        Called from the agent-poll callback, which already has a fresh
+        ``sessions/*.json`` status map -- so turn tracking adds no IO.
+        """
+        if not self._hexec_grants:
+            return
+        now = time.time()
+        for sid, grant in list(self._hexec_grants.items()):
+            status = (status_map or {}).get(sid) or ""
+            if status in HEXEC_TURN_ACTIVE_STATUSES:
+                grant["armed"] = True
+                continue
+            reason = None
+            if grant.get("armed"):
+                # Was mid-turn, now it isn't: the turn that owned this grant
+                # is over.  A vanished session (claude exited) counts too.
+                reason = f"turn ended (status={status or 'gone'})"
+            elif now - grant.get("created", 0.0) > HEXEC_GRANT_MAX_AGE_SEC:
+                # Never observed an active turn -- claude may have finished
+                # between polls, or its metadata went stale.  Age it out
+                # rather than letting it sit armed forever.
+                reason = "max age reached without observing a turn"
+            if reason:
+                del self._hexec_grants[sid]
+                log.info(
+                    "hexec grant expired: session=%s scope=%s uses=%d (%s)",
+                    sid, grant.get("scope"), grant.get("uses"), reason,
+                )
+
+    def _clear_hexec_grants(self, why: str) -> None:
+        if not self._hexec_grants:
+            return
+        log.info("Clearing %d hexec grant(s): %s", len(self._hexec_grants), why)
+        self._hexec_grants.clear()
+
+    def _hexec_grant_for(self, event: dict) -> Optional[dict]:
+        """Return the grant that auto-allows ``event``, or ``None``.
+
+        Consumes a use on a hit.  Hitting the use cap retires the grant
+        immediately, so the request that tripped it still gets a dialog.
+        """
+        sid = event.get("session_id") or event.get("sessionId")
+        if not isinstance(sid, str) or not sid:
+            return None
+        grant = self._hexec_grants.get(sid)
+        if grant is None:
+            return None
+        if not _hexec_grant_matches(grant, event):
+            return None
+        if time.time() - grant.get("created", 0.0) > HEXEC_GRANT_MAX_AGE_SEC:
+            del self._hexec_grants[sid]
+            log.info("hexec grant expired on use: session=%s (max age)", sid)
+            return None
+        if grant.get("uses", 0) >= HEXEC_GRANT_MAX_USES:
+            del self._hexec_grants[sid]
+            log.warning(
+                "hexec grant retired: session=%s hit %d uses",
+                sid, HEXEC_GRANT_MAX_USES,
+            )
+            return None
+        grant["uses"] = grant.get("uses", 0) + 1
+        return grant
+
     def _show_permission_dialog(self, name: str, event: dict) -> None:
+        grant = self._hexec_grant_for(event)
+        if grant is not None:
+            self._auto_allow_hexec(name, event, grant)
+            return
         self._permission_queue.append((name, event))
+        log.info(
+            "Enqueue permission dialog %s (queue=%d active=%s)",
+            name, len(self._permission_queue), self._permission_dialog_active,
+        )
         self._process_next_permission()
 
+    def _auto_allow_hexec(self, name: str, event: dict, grant: dict) -> None:
+        """Answer a request from a grant, with no dialog.
+
+        Loud on purpose: the whole point is that the user is not looking at
+        a dialog, so the command that ran has to be recoverable from the log
+        and visible in the status bar.
+        """
+        rid = event.get("_clacogui_request_id") or os.path.splitext(name)[0]
+        tool_input = event.get("tool_input") or event.get("toolInput") or {}
+        command = (tool_input or {}).get("command") or "" if isinstance(
+            tool_input, dict
+        ) else ""
+        log.info(
+            "Auto-allowing hexec (grant scope=%s use %d/%d): %s",
+            grant.get("scope"), grant.get("uses"), HEXEC_GRANT_MAX_USES,
+            command,
+        )
+        self._open_requests.discard(name)
+        self.show_transient_status(
+            f"Auto-allowed hexec ({grant.get('uses')} this turn): "
+            f"{command[:60]}",
+            revert_after_ms=5000,
+        )
+        self._write_permission_response(
+            name,
+            rid,
+            {
+                "decision": "allow",
+                "reason": (
+                    f"Auto-allowed by clacogui turn grant "
+                    f"(scope={grant.get('scope')})"
+                ),
+            },
+            advance_queue=False,
+        )
+
     def _process_next_permission(self) -> None:
-        if self._permission_dialog_active or not self._permission_queue:
+        if self._permission_dialog_active:
+            # A modal is already showing.  Enqueue-only.  If this state is
+            # ever wrong (dialog was destroyed but the flag never cleared),
+            # every subsequent permission request will strand.
+            log.debug(
+                "Not opening permission dialog: another is active "
+                "(queue=%d)", len(self._permission_queue),
+            )
             return
-        self._permission_dialog_active = True
-        name, event = self._permission_queue.pop(0)
-        self._do_show_permission_dialog(name, event)
+        while self._permission_queue:
+            name, event = self._permission_queue.pop(0)
+            # Re-check the grant here, not just on arrival: polls keep running
+            # inside ShowModal's nested loop, so a request can be enqueued
+            # while the dialog that creates the grant is still open.  Checking
+            # only on arrival put a second dialog in front of the user for a
+            # request the grant was meant to cover.
+            grant = self._hexec_grant_for(event)
+            if grant is None:
+                self._permission_dialog_active = True
+                log.info("Opening permission dialog: %s", name)
+                self._do_show_permission_dialog(name, event)
+                return
+            self._auto_allow_hexec(name, event, grant)
 
     def _do_show_permission_dialog(self, name: str, event: dict) -> None:
         rid = event.get("_clacogui_request_id") or os.path.splitext(name)[0]
@@ -3561,6 +4213,7 @@ class MainFrame(wx.Frame):
                 reason = dlg.reason
                 updated_permissions = list(dlg.updated_permissions)
                 updated_input = dict(dlg.updated_input)
+                grant_scope = dlg.hexec_grant_scope
             finally:
                 self._current_permission_dialog = None
                 dlg.Destroy()
@@ -3568,10 +4221,12 @@ class MainFrame(wx.Frame):
             self._open_requests.discard(name)
             self._permission_dialog_active = False
 
-        backend = self.backend
-        if backend is None:
-            wx.CallAfter(self._process_next_permission)
-            return
+        # Record the grant before writing the response: the very next poll
+        # may already carry the follow-up request this grant is meant to
+        # cover.
+        if allow and grant_scope in HEXEC_GRANT_SCOPES:
+            self._grant_hexec(event, grant_scope)
+
         response = {
             "decision": "allow" if allow else "deny",
             "reason": reason,
@@ -3580,6 +4235,27 @@ class MainFrame(wx.Frame):
             response["updated_permissions"] = updated_permissions
         if allow and updated_input:
             response["updated_input"] = updated_input
+        self._write_permission_response(name, rid, response)
+
+    def _write_permission_response(
+        self,
+        name: str,
+        rid: str,
+        response: dict,
+        advance_queue: bool = True,
+    ) -> None:
+        """Write a response file and delete the request that prompted it.
+
+        Shared by the dialog path and the hexec auto-allow path.
+        ``advance_queue`` is False for auto-allow: that path never took the
+        ``_permission_dialog_active`` flag, so pumping the queue from its
+        callback could open a second dialog alongside a live one.
+        """
+        backend = self.backend
+        if backend is None:
+            if advance_queue:
+                wx.CallAfter(self._process_next_permission)
+            return
         response_rel = f"{AGENT_RESPONSES_DIR}/{rid}.json"
         request_rel = f"{AGENT_REQUESTS_DIR}/{name}"
         body = json.dumps(response, indent=2).encode("utf-8")
@@ -3599,7 +4275,8 @@ class MainFrame(wx.Frame):
             return None
 
         def _after_write(_r, _e):
-            wx.CallAfter(self._process_next_permission)
+            if advance_queue:
+                wx.CallAfter(self._process_next_permission)
 
         submit_io_write(work, _after_write)
 
@@ -3735,10 +4412,14 @@ class MainFrame(wx.Frame):
         # the new sessions/ directory.
         self._claude_status_map = {}
         self._claude_session_names = {}
+        # Grants are keyed by session_id from the old root's metadata, and
+        # expiry depends on the status map we just cleared.  Nothing here
+        # survives a backend swap.
+        self._clear_hexec_grants("backend changed")
         self._update_status()
-        # Sweep request files that can't possibly belong to a live
-        # agent any more (see ``_gc_stale_agent_requests``).
-        self._gc_stale_agent_requests()
+        # Sweep request/response files that can't possibly belong to a
+        # live agent any more (see ``_gc_stale_agent_files``).
+        self._gc_stale_agent_files()
 
     def _on_open(self, _event: wx.CommandEvent) -> None:
         if self.backend is None:
@@ -3796,11 +4477,24 @@ class MainFrame(wx.Frame):
         if idx == wx.NOT_FOUND:
             return
         page = self.notebook.GetPage(idx)
+        # Read the session id before destroying the page: a grant is scoped to
+        # a session, and with the tab gone the user has no way to see (or
+        # revoke) one that outlived it.
+        closing_sid = None
+        getter = getattr(page, "claude_session_id", None)
+        if callable(getter):
+            try:
+                closing_sid = getter()
+            except Exception:
+                log.debug("claude_session_id() crashed on close", exc_info=True)
         self.notebook.RemovePage(idx)
         try:
             page.Destroy()
         except Exception:
             log.exception("Error destroying conversation page")
+        if closing_sid and closing_sid in self._hexec_grants:
+            del self._hexec_grants[closing_sid]
+            log.info("hexec grant dropped: tab for session %s closed", closing_sid)
         self._update_window_title()
         # ``RemovePage`` doesn't reliably fire EVT_NOTEBOOK_PAGE_CHANGED
         # on every wx backend, so explicitly resync both status-bar
@@ -3949,6 +4643,24 @@ def _looks_local(spec: str) -> bool:
 # ---------------------------------------------------------------------------
 # Agent (hook) helpers
 # ---------------------------------------------------------------------------
+
+
+def _outgoing_pending_id(name: str) -> str:
+    """Map an outgoing basename back to the pending-send id that owns it.
+
+    The launcher renames envelopes in place to signal state, so one id can
+    appear as ``<id>.json``, ``<id>.json.part``, ``<id>.json.needs_decision``
+    or ``<id>.json.failed``.  ``_pending_sends`` is keyed by the bare id, so
+    the GC has to strip whatever suffix chain is present before comparing.
+    """
+    base = name
+    for suffix in (".needs_decision", ".failed", ".part"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    if base.endswith(".json"):
+        base = base[: -len(".json")]
+    return base
 
 
 def _safe_list_basenames(backend: FsBackend, rel: str) -> list[str]:
@@ -4450,6 +5162,15 @@ class PermissionRequestDialog(wx.Dialog):
         self.allowed: bool = False
         self.reason: str = ""
         self.updated_permissions: list[dict] = []
+        #   ``hexec_grant_scope``     -- ``"subcommand"`` / ``"any"`` if the
+        #                                user allowed via one of the
+        #                                turn-grant buttons, else None.  Read
+        #                                by ``_do_show_permission_dialog``,
+        #                                which owns the grant bookkeeping;
+        #                                unlike ``updated_permissions`` this
+        #                                never reaches the agent, because the
+        #                                grant is enforced GUI-side only.
+        self.hexec_grant_scope: Optional[str] = None
         # For AskUserQuestion: the ``updatedInput`` payload (original
         # questions + an ``answers`` map) sent back on Allow so the tool
         # resolves with the user's selection instead of prompting in a TUI.
@@ -4487,6 +5208,22 @@ class PermissionRequestDialog(wx.Dialog):
         # to persist at.
         self._suggestions: list[dict] = list(
             event.get("permission_suggestions") or []
+        )
+
+        # Turn-grant buttons only appear for a plain hexec invocation we can
+        # parse with confidence, and only when the request carries a
+        # session_id to scope the grant to.  Anything else (metacharacters, a
+        # non-Bash tool, no session) gets the ordinary Allow / Deny pair.
+        self._hexec_subcommand: Optional[str] = (
+            _hexec_subcommand(tool_input.get("command") or "")
+            if str(tool) == "Bash"
+            else None
+        )
+        sid_for_grant = event.get("session_id") or event.get("sessionId")
+        self._can_grant_hexec: bool = bool(
+            self._hexec_subcommand
+            and isinstance(sid_for_grant, str)
+            and sid_for_grant
         )
 
         panel = wx.Panel(self)
@@ -4710,6 +5447,37 @@ class PermissionRequestDialog(wx.Dialog):
             self.Bind(
                 wx.EVT_BUTTON, self._on_allow_always, self._allow_always_btn
             )
+
+        # ---- hexec turn-grant row (its own row, above Allow / Deny) -------
+        # Two separate buttons rather than one dropdown: the scopes differ in
+        # blast radius (``bash`` is arbitrary host execution, the other
+        # subcommands are not), so the choice should be a visible, distinctly
+        # labelled action rather than hidden behind a menu.  Mnemonics &X and
+        # &H avoid Alt-A / Alt-D / Alt-W / Alt-J.
+        self._grant_sub_btn: Optional[wx.Button] = None
+        self._grant_any_btn: Optional[wx.Button] = None
+        if self._can_grant_hexec:
+            grant_row = wx.BoxSizer(wx.HORIZONTAL)
+            grant_row.AddStretchSpacer(1)
+            self._grant_sub_btn = wx.Button(
+                panel,
+                wx.ID_ANY,
+                f"Allow he&xec {self._hexec_subcommand} this turn",
+                name="AllowHexecSubcommandThisTurn",
+            )
+            self._grant_any_btn = wx.Button(
+                panel,
+                wx.ID_ANY,
+                "Allow any &hexec this turn",
+                name="AllowHexecAnyThisTurn",
+            )
+            grant_row.Add(self._grant_sub_btn, 0, wx.RIGHT, 8)
+            grant_row.Add(self._grant_any_btn, 0)
+            vbox.Add(grant_row, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 8)
+            self.Bind(
+                wx.EVT_BUTTON, self._on_grant_subcommand, self._grant_sub_btn
+            )
+            self.Bind(wx.EVT_BUTTON, self._on_grant_any, self._grant_any_btn)
 
         # ---- buttons -----------------------------------------------------
         btns = wx.BoxSizer(wx.HORIZONTAL)
@@ -5013,6 +5781,30 @@ class PermissionRequestDialog(wx.Dialog):
         self.allowed = True
         self.reason = self._reason.GetValue().strip()
         self.updated_permissions = list(chosen)
+        self.EndModal(wx.ID_YES)
+
+    # -- hexec turn-grant helpers -------------------------------------------
+
+    def _on_grant_subcommand(self, _event: wx.CommandEvent) -> None:
+        self._commit_hexec_grant("subcommand")
+
+    def _on_grant_any(self, _event: wx.CommandEvent) -> None:
+        self._commit_hexec_grant("any")
+
+    def _commit_hexec_grant(self, scope: str) -> None:
+        """Allow this request and ask the frame for a turn-scoped grant.
+
+        ``updated_permissions`` stays empty: a turn grant is enforced by the
+        GUI and must never be written into Claude's settings, which have no
+        way to express (or expire) a per-turn rule.
+        """
+        if not self._can_grant_hexec:
+            return
+        self._stop_focus_timer()
+        self.allowed = True
+        self.reason = self._reason.GetValue().strip()
+        self.updated_permissions = []
+        self.hexec_grant_scope = scope
         self.EndModal(wx.ID_YES)
 
     def _on_deny(self, _event: wx.CommandEvent) -> None:

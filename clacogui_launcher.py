@@ -36,12 +36,17 @@ Side-channel protocol -- see ``~/.claude/clacogui_outgoing/<id>.json``::
       "force_clear":  false
     }
 
-    # "Interrupt claude" envelope -- writes a single Esc (``\x1b``)
-    # to the PTY master so claude cancels the current turn.  ESC is
-    # idempotent in claude's TUI (unlike Ctrl+C, which exits on the
-    # second hit) so this is safe to spam.  No ``text`` field; we
-    # bypass all gates (claude_busy in particular -- interrupt is
-    # *meant* for busy claude).
+    # "Interrupt claude" envelope -- writes a cancel byte to the PTY
+    # master.  In claude's TUI (status != "shell") we send a single
+    # Esc (``\x1b``), which is idempotent so this is safe to spam.
+    # In shell mode (claude is running a subprocess) we send Ctrl+C
+    # (``\x03``); that's NOT idempotent (a second Ctrl+C at claude's
+    # own prompt exits claude on the "press again" prompt), so we
+    # allow *bursts* of Ctrl+C -- rapid contiguous presses within
+    # ``_CTRL_C_BURST_WINDOW_SEC`` of each other -- but close the
+    # burst as soon as the gap exceeds the window, and re-open only
+    # when status transitions out of "shell".  Bypasses the busy
+    # gate -- interrupt is *meant* for busy claude.
     {
       "id":           "<unix-millis>_<rand>",
       "session_id":   "<claude session id>",
@@ -52,11 +57,14 @@ State the launcher writes back, by mutating the same file:
 
 * file deleted             -> delivered
 * ``<id>.json.failed``     -> error (with appended ``error`` field)
-* ``<id>.json.needs_decision`` -> blocked because the user has
-  uncommitted text in claude's input box; the GUI must rewrite the
-  file with ``force_clear: true`` and rename back to ``<id>.json`` to
-  authorize an erasure-then-paste.  Interrupt envelopes never use
-  this state -- they bypass the user-buffer gate entirely.
+
+Uncommitted text in claude's input box does not block a send: the
+launcher erases the prompt and delivers anyway (see
+``_build_inject_segments``).  ``<id>.json.needs_decision`` is a retired
+state -- older launchers parked envelopes there and waited for the GUI
+to pop a dialog, which lost the message whenever nobody answered it.
+The GUI still recognises the suffix so a new GUI works against an old
+installed launcher; it just auto-authorises the erasure.
 """
 
 from __future__ import annotations
@@ -111,6 +119,16 @@ OUTGOING_DIR = "clacogui_outgoing"
 # paste (``\x1b[200~ ... \x1b[201~``) was tried first but did not
 # take in practice, so we fall back to direct Ctrl+J injection plus a
 # single trailing CR (``\r``, Ctrl+M) to submit.
+# Burst window for shell-mode Ctrl+C.  A single Ctrl+C is fired the
+# first time the user hits Ctrl+. inside a shell window; any additional
+# hits within this window of the previous send are also allowed (some
+# subprocesses need multiple SIGINTs to die).  Once the gap exceeds
+# this window we stop firing until claude leaves shell mode -- the
+# rationale is that lingering isolated hits are more likely to land
+# after the subprocess has already died and would hit claude's own
+# "press again to exit" state.
+_CTRL_C_BURST_WINDOW_SEC = 2.0
+
 _CR = b"\r"   # Ctrl+M -- "send" in claude's prompt
 # Esc byte -- claude's TUI treats this as "cancel current turn" /
 # "stop streaming response".  Crucially it's idempotent: pressing
@@ -118,6 +136,16 @@ _CR = b"\r"   # Ctrl+M -- "send" in claude's prompt
 # hit, which is why we use Esc instead).  Used by the
 # ``action: interrupt`` envelope.
 _ESC = b"\x1b"
+# Ctrl+C -- interrupts the foreground subprocess claude spawned while
+# in shell mode.  ESC does nothing to that subprocess (the shell
+# doesn't consume ESC).  NOT idempotent at claude's own prompt: a
+# second Ctrl+C within claude's "press again to exit" window quits
+# claude.  We allow bursts of Ctrl+C within
+# ``_CTRL_C_BURST_WINDOW_SEC`` of each other but close the burst on
+# the first gap that exceeds the window; re-opens on the shell ->
+# not-shell status transition.  See ``_shell_burst_open`` /
+# ``_last_ctrl_c_sent_at`` and ``_refresh_claude_status``.
+_CTRL_C = b"\x03"
 
 # Pause inserted between "type the text" and "press Enter" when
 # delivering a queued message.  Claude's TUI (Ink + readline) does
@@ -137,8 +165,7 @@ _PRE_SUBMIT_PAUSE_SEC = 0.12
 _POST_ERASE_PAUSE_SEC = 0.05
 
 # Erasure sequence we send before injecting a message when the user
-# has uncommitted text in claude's prompt and the GUI has
-# authorized an erase-and-send.
+# has uncommitted text in claude's prompt.
 _CTRL_E = b"\x05"   # readline 'end-of-line'
 _CTRL_U = b"\x15"   # readline 'kill-to-start-of-line' (whole line in claude)
 _CTRL_W = b"\x17"   # kill word
@@ -147,6 +174,28 @@ _BACKSPACE = b"\x7f"
 # Cap the number of synthetic backspaces we send so a desync of the
 # tracker can't lock the launcher into a long write loop.
 _MAX_ERASE_BACKSPACES = 1000
+
+# Floor for the backspace flood.  ``prior_buffer`` comes from
+# ``UserBufferTracker``, which is a byte counter over the user's stdin
+# and *undercounts* in practice: bytes typed before the first-idle
+# baseline are discarded, and any printable byte claude consumes
+# without a CR (a bare ``1``/``y`` at a numbered prompt, a menu pick)
+# leaves the counter out of step with the real prompt contents.  Since
+# we now erase unconditionally rather than asking the user, sizing the
+# flood purely from that estimate would leave residue prepended to the
+# message.  Erase a generous fixed minimum instead -- backspaces past
+# the start of an empty prompt are a no-op in claude's TUI, so
+# over-erasing costs nothing but a repaint.
+_MIN_ERASE_BACKSPACES = 256
+
+# How many ``Ctrl+E`` + ``Ctrl+U`` + ``Backspace`` cycles to prepend to
+# the flood.  Ctrl+U only kills the *current* line, so a multi-line
+# prompt needs one cycle per line: Ctrl+E anchors at the end of the
+# line, Ctrl+U empties it, and the single Backspace joins with the line
+# above (a no-op once we reach line 1, so extra cycles are harmless).
+# This collapses the common multi-line case in a handful of keystrokes;
+# the trailing flood mops up anything deeper than this.
+_ERASE_CYCLES = 8
 
 # Polling cadence for the side channel.  200 ms is invisible to humans
 # for chat-style sends and keeps wakeups low.
@@ -185,6 +234,20 @@ _QUIET_AFTER_KEYSTROKE_SEC = 0.5
 # Outgoing files older than this are considered stale and rejected.
 # Prevents re-delivery of messages stuck from a prior session/disconnect.
 _OUTGOING_MAX_AGE_SEC = 300  # 5 minutes
+
+# Claude ``status`` values in which it is safe to inject a queued
+# ``send`` envelope.  ``idle`` = TUI prompt is up, empty, waiting for
+# a user message; typing body + CR does the obvious thing.
+# ``shell`` = claude has spawned a foreground subprocess on the same
+# PTY slave, so bytes written to the master reach that subprocess.
+# The user can still send follow-up prompts to claude by typing them
+# while a shell command is running (the shell buffers the bytes, then
+# claude picks them back up when the shell exits and hands the TUI
+# back the line editor -- this is the same behaviour the user sees
+# when they type directly).  Anything else (``busy``, ``compacting``,
+# ``unknown``) blocks the send; the file stays queued and retries on
+# the next status transition.
+_INJECTABLE_STATUSES = frozenset({"idle", "shell"})
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +693,25 @@ class Launcher:
         self._logged_session_skips: set[str] = set()
         self._logged_gate_skips: dict[str, str] = {}
 
+        # Shell-mode interrupt guard.  While claude is in ``shell``
+        # status we fire Ctrl+C in bursts: the first press is always
+        # allowed, and subsequent presses within
+        # ``_CTRL_C_BURST_WINDOW_SEC`` of the previous one are also
+        # allowed (some subprocesses need multiple SIGINTs to die).
+        # Once the gap exceeds the burst window we stop firing until
+        # claude leaves shell mode -- the rationale is that a lone
+        # late Ctrl+. is more likely to land after the subprocess
+        # already died, where it would hit claude's own "press again
+        # to exit" state.  The window re-arms on the shell ->
+        # not-shell status transition (see ``_refresh_claude_status``).
+        # Non-shell interrupts (ESC) don't consult these fields --
+        # ESC is idempotent so spam-safe.
+        self._last_ctrl_c_sent_at: float = 0.0
+        self._shell_burst_open: bool = True
+        # Prior tick's status, used to detect the shell -> non-shell
+        # edge that re-arms the burst window.
+        self._prev_claude_status: str = "unknown"
+
         # Original parent terminal attrs, captured before we go raw.
         self._original_termios: Optional[list] = None
 
@@ -690,6 +772,23 @@ class Launcher:
             return
         st = meta.get("status")
         if isinstance(st, str):
+            # Re-open the shell-mode Ctrl+C burst window on the
+            # shell -> not-shell edge.  Rationale: once claude leaves
+            # shell mode, whatever subprocess we might have
+            # interrupted is gone, so a future user request to
+            # interrupt is talking about the *next* shell invocation
+            # and deserves a fresh first-press allowance.  The burst
+            # closes inside the interrupt branch (below) when the gap
+            # between presses exceeds ``_CTRL_C_BURST_WINDOW_SEC``.
+            if self._prev_claude_status == "shell" and st != "shell":
+                if not self._shell_burst_open:
+                    _log(
+                        "re-open interrupt burst on shell exit",
+                        {"prev": self._prev_claude_status, "new": st},
+                    )
+                self._shell_burst_open = True
+                self._last_ctrl_c_sent_at = 0.0
+            self._prev_claude_status = st
             self._claude_status = st
             # First time claude is idle: the TUI prompt is up and empty,
             # so any buffer estimate accrued during startup/resume is
@@ -735,17 +834,27 @@ class Launcher:
     def _can_inject_now(self) -> tuple[bool, str]:
         if self._session_id is None:
             return False, "session_unknown"
-        # Refresh status if it's stale (we re-check on every tick anyway,
-        # so this is mostly belt-and-suspenders).
-        if self._claude_status != "idle":
+        # Injection is safe in ``idle`` (TUI prompt open) and ``shell``
+        # (claude spawned a foreground subprocess on our PTY slave;
+        # bytes reach it directly).  Everything else -- ``busy``,
+        # ``compacting``, ``unknown``, future values -- blocks so we
+        # never race into a state we haven't validated.
+        if self._claude_status not in _INJECTABLE_STATUSES:
             return False, f"claude_{self._claude_status}"
-        if self._user.estimate() > 0:
-            return False, "user_has_uncommitted_text"
+        # Check the quiet window *before* the buffer estimate.  The
+        # caller turns ``user_has_uncommitted_text`` into an
+        # erase-and-send rather than a retry, and it doesn't re-consult
+        # this gate afterwards -- so if that reason won the race we
+        # would wipe the prompt while the user was still mid-word.
+        # Reporting ``user_just_submitted`` first means we simply retry
+        # on the next 200 ms tick and only erase once they've paused.
         if (
             time.monotonic() - self._user.last_keystroke_ts
             < _QUIET_AFTER_KEYSTROKE_SEC
         ):
             return False, "user_just_submitted"
+        if self._user.estimate() > 0:
+            return False, "user_has_uncommitted_text"
         return True, "ok"
 
     # -- delivery -----------------------------------------------------------
@@ -772,24 +881,41 @@ class Launcher:
         claude's prompt, so we use timing instead.
 
         Order, when ``with_erasure``:
-          1. Ctrl+E (move cursor to end), Ctrl+U (kill line),
-             N backspaces (capped at ``_MAX_ERASE_BACKSPACES``)
+          1. ``_ERASE_CYCLES`` repetitions of Ctrl+E (end of line) +
+             Ctrl+U (kill line) + Backspace (join with the line above),
+             then N backspaces (clamped to
+             ``_MIN_ERASE_BACKSPACES``..``_MAX_ERASE_BACKSPACES``)
              -- single write, followed by a small settle pause
           2. The user's text, with CR/CRLF normalised to LF
              (``\\n``, Ctrl+J) -- claude's "insert newline"
              keystroke; followed by ``_PRE_SUBMIT_PAUSE_SEC``
           3. CR (``\\r``, Ctrl+M / Enter) -- submits the prompt
 
+        Multi-line prompts are why step 1 is a loop rather than a
+        single Ctrl+E + Ctrl+U: Ctrl+U kills only the line the cursor
+        is on, so on a 3-line prompt it would leave 2 lines behind and
+        our message would be appended to them.  Each cycle clears one
+        line and steps up to the previous one.  Backspace also crosses
+        newlines in claude's TUI, so the trailing flood keeps walking
+        upward through any lines the cycles didn't reach.
+
         ``prior_buffer`` is the user-buffer estimate immediately
-        before we erase, used to size the backspace flood; we pad an
-        extra ``+ 32`` for safety.
+        before we erase.  It only ever *raises* the flood size above
+        ``_MIN_ERASE_BACKSPACES``; we never shrink below the floor,
+        because the estimate is known to undercount (see that
+        constant).
         """
         segments: list[tuple[bytes, float]] = []
         if with_erasure:
             erase = bytearray()
-            erase += _CTRL_E
-            erase += _CTRL_U
-            n = min(prior_buffer * 2 + 32, _MAX_ERASE_BACKSPACES)
+            for _ in range(_ERASE_CYCLES):
+                erase += _CTRL_E
+                erase += _CTRL_U
+                erase += _BACKSPACE
+            n = min(
+                max(prior_buffer * 2 + 32, _MIN_ERASE_BACKSPACES),
+                _MAX_ERASE_BACKSPACES,
+            )
             erase += _BACKSPACE * n
             segments.append((bytes(erase), _POST_ERASE_PAUSE_SEC))
         normalised = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -898,15 +1024,77 @@ class Launcher:
 
             action = envelope.get("action")
             if action == "interrupt":
-                # Single Esc keystroke -- bypass all gates.  Esc
-                # is the *point* of interrupt: it's only useful when
-                # claude is busy, and unlike Ctrl+C it's idempotent
-                # so spamming it is safe.  We do NOT touch the
-                # user-buffer tracker here: Esc cancels the current
-                # turn / streaming, it doesn't affect what's in the
-                # input prompt.
+                # Interrupt byte depends on claude's current status:
+                #
+                # * status == "shell": claude has spawned a foreground
+                #   subprocess on the PTY.  ESC does nothing to a
+                #   POSIX shell/child; we need Ctrl+C (SIGINT).  But
+                #   Ctrl+C is NOT idempotent at claude's own prompt:
+                #   once the subprocess dies and claude is back at
+                #   the "press again to exit" state, a second Ctrl+C
+                #   quits claude.  We use a burst rule instead of a
+                #   strict one-shot: the first press is always
+                #   allowed, and any subsequent press within
+                #   ``_CTRL_C_BURST_WINDOW_SEC`` of the previous one
+                #   is also allowed (some subprocesses need repeated
+                #   SIGINTs).  Once the gap exceeds the window we
+                #   close the burst and stop firing until claude
+                #   leaves shell mode -- a late lone press is likely
+                #   to arrive after the subprocess already died and
+                #   would hit claude's exit state.
+                #
+                # * anything else: single Esc.  Idempotent -- safe to
+                #   spam.  Cancels a streaming claude turn.
+                #
+                # In both cases we bypass the injection gates: the
+                # whole point of interrupt is that it's useful when
+                # claude is busy.
+                if self._claude_status == "shell":
+                    now = time.monotonic()
+                    first_press = self._last_ctrl_c_sent_at == 0.0
+                    gap = (
+                        None
+                        if first_press
+                        else now - self._last_ctrl_c_sent_at
+                    )
+                    in_burst = (
+                        first_press
+                        or (gap is not None and gap <= _CTRL_C_BURST_WINDOW_SEC)
+                    )
+                    if not self._shell_burst_open or not in_burst:
+                        # Close the burst if this is the tick that
+                        # first observed the gap exceeding the window;
+                        # subsequent presses in this shell window will
+                        # keep hitting the closed branch.
+                        if self._shell_burst_open and not in_burst:
+                            self._shell_burst_open = False
+                            _log(
+                                "close interrupt burst: gap exceeded window",
+                                {
+                                    "id": env_id,
+                                    "gap_sec": round(gap, 3) if gap else None,
+                                    "window_sec": _CTRL_C_BURST_WINDOW_SEC,
+                                },
+                            )
+                        # Leave the envelope on disk; the re-open edge
+                        # in ``_refresh_claude_status`` will let it
+                        # fire (as ESC) after status leaves "shell".
+                        # Log once per path.
+                        if self._logged_gate_skips.get(path) != "shell_burst_closed":
+                            _log(
+                                "skip: shell-mode interrupt burst closed; "
+                                "waiting for status transition to re-open",
+                                {"id": env_id},
+                            )
+                            self._logged_gate_skips[path] = "shell_burst_closed"
+                        continue
+                    payload = _CTRL_C
+                    disarm_after = True
+                else:
+                    payload = _ESC
+                    disarm_after = False
                 try:
-                    os.write(self._master_fd, _ESC)
+                    os.write(self._master_fd, payload)
                 except OSError as e:
                     _log(
                         "rename to .failed: interrupt write failed",
@@ -921,9 +1109,19 @@ class Launcher:
                         },
                     )
                     continue
+                if disarm_after:
+                    # Record the send time so the next press in this
+                    # shell window can evaluate the burst gap.  We do
+                    # NOT close the burst here; that only happens when
+                    # a future press arrives with a gap > window.
+                    self._last_ctrl_c_sent_at = time.monotonic()
                 _log(
                     "delivered interrupt",
-                    {"id": env_id, "claude_status": self._claude_status},
+                    {
+                        "id": env_id,
+                        "claude_status": self._claude_status,
+                        "byte": "ctrl_c" if payload == _CTRL_C else "esc",
+                    },
                 )
                 self._logged_gate_skips.pop(path, None)
                 self._logged_session_skips.discard(path)
@@ -972,30 +1170,32 @@ class Launcher:
             force_clear = bool(envelope.get("force_clear"))
 
             if not ok and reason == "user_has_uncommitted_text":
+                # Uncommitted text in claude's prompt is erased
+                # unconditionally: whatever is in there gets wiped and
+                # our message is delivered.  We used to park the
+                # envelope as ``<id>.json.needs_decision`` and wait for
+                # the GUI to pop a dialog, but that made the send
+                # depend on a dialog nobody reliably saw -- if the GUI
+                # had restarted or the tab had been closed, the file was
+                # orphaned and silently reaped an hour later, so the
+                # message was simply lost.  Erasing is the behaviour the
+                # user always picked anyway.
+                #
+                # ``_build_inject_segments`` prepends the erasure in the
+                # with_erasure path, so the buffer is cleared by the
+                # same write that delivers our text.  Other gates
+                # (claude_busy, user_just_submitted, session_unknown)
+                # still apply below -- they're orthogonal to "what's in
+                # the input box".
                 if not force_clear:
-                    # Need user to make a decision.  Hand it off via the
-                    # .needs_decision suffix; the GUI will show a dialog
-                    # and rewrite us back as <id>.json with force_clear
-                    # set if the user chose erase-and-send.
-                    _rename_with_suffix(
-                        path,
-                        ".needs_decision",
+                    _log(
+                        "auto erase-and-send: prompt has uncommitted text",
                         {
-                            "reason": "user_has_uncommitted_text",
-                            "noticed_at": int(time.time() * 1000),
+                            "id": env_id,
+                            "buffer_estimate": self._user.estimate(),
                         },
                     )
-                    continue
-                # force_clear=True: the user has authorised us to
-                # wipe whatever they typed in claude's TUI before
-                # our message lands.  ``_build_inject_segments``
-                # will prepend Ctrl+E + Ctrl+U + a backspace flood
-                # in the with_erasure path, so the buffer is cleared
-                # by the same write that delivers our text.  Bypass
-                # this gate.  Other gates (claude_busy,
-                # user_just_submitted, session_unknown) still apply
-                # below -- they're orthogonal to "what's in the
-                # input box".
+                    force_clear = True
                 ok = True
                 reason = "ok (force_clear bypass)"
 
