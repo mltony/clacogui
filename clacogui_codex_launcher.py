@@ -28,8 +28,11 @@ straight through.  On a 200 ms side channel the launcher also:
 * publishes this TUI's thread and busy/idle state to
   ``$CODEX_HOME/clacogui_sessions/<pid>.json`` for the clacogui status bar;
 * delivers GUI messages from ``$CODEX_HOME/clacogui_outgoing/<id>.json``
-  with ``codex queue --thread <id> --message <text>`` -- Codex queues it
-  behind a running turn by itself, so nothing is typed into the TUI;
+  without typing into the TUI: while Codex is idle it starts the turn with
+  the app-server's ``turn/start`` (``codex queue`` would sit unprocessed
+  after an interrupt -- Codex pauses its queue then); while a turn runs it
+  uses ``codex queue --thread <id> --message <text>`` so the message
+  follows that turn;
 * turns an ``action: interrupt`` envelope into an interrupt (see above),
   only while a turn is running (a second Esc at an idle Codex prompt
   opens "edit previous message").
@@ -176,7 +179,16 @@ def _atomic_write_json(path: str, payload: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-    os.replace(tmp, path)
+    # Windows refuses to replace a file another process (e.g. the FTP server
+    # serving it to the GUI) has open at that moment; retry briefly.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +373,18 @@ def _claim(path: str) -> bool:
                 with open(lock, encoding="utf-8") as f:
                     owner = int(f.read().strip() or 0)
             except (OSError, ValueError):
-                return False
+                owner = 0
             if owner == os.getpid():
                 return True
-            if _pid_alive(owner):
+            if owner == 0:
+                # Created but its pid not written yet -- another launcher is
+                # mid-claim.  Only an old empty lock counts as abandoned.
+                try:
+                    if time.time() - os.stat(lock).st_mtime < 10:
+                        return False
+                except OSError:
+                    return False
+            elif _pid_alive(owner):
                 return False
             _log("breaking stale envelope lock", {"path": path, "owner": owner})
             try:
@@ -577,6 +597,63 @@ class _AppServerRpc:
             pass
 
 
+def _rpc_turn_start(codex_cmd: list[str], thread_id: str, text: str) -> str:
+    rpc = _AppServerRpc(codex_cmd)
+    try:
+        rpc.call("initialize", {"clientInfo": {"name": "clacogui", "version": "1"}})
+        rpc.notify("initialized")
+        result = rpc.call(
+            "turn/start",
+            {"threadId": thread_id, "input": [{"type": "text", "text": text}]},
+            timeout=30,
+        )
+    finally:
+        rpc.close()
+    turn = result.get("turn") if isinstance(result, dict) else None
+    return f"started turn {turn.get('id') if isinstance(turn, dict) else '?'}"
+
+
+def _codex_queue(codex_cmd: list[str], thread_id: str, text: str) -> str:
+    proc = subprocess.run(
+        [*codex_cmd, "queue", "--thread", thread_id, "--message", text],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_QUEUE_TIMEOUT_SEC,
+        **_quiet_popen_kwargs(),
+    )
+    if proc.returncode != 0:
+        lines = (proc.stderr or proc.stdout).strip().splitlines()
+        raise OSError(f"codex queue exited {proc.returncode}: {lines[-1] if lines else ''}")
+    return proc.stdout.strip()[-200:]
+
+
+class _SendJob:
+    """One delivery running on a worker thread, so the terminal never stalls."""
+
+    def __init__(self, codex_cmd: list[str], thread_id: str, text: str, idle: bool) -> None:
+        self.started = time.monotonic()
+        self.how = "turn/start" if idle else "codex queue"
+        self.result: Optional[tuple[bool, str]] = None
+        args = (codex_cmd, thread_id, text, idle)
+        threading.Thread(target=self._run, args=args, daemon=True).start()
+
+    def _run(self, codex_cmd, thread_id, text, idle) -> None:
+        try:
+            if idle:
+                try:
+                    self.result = (True, _rpc_turn_start(codex_cmd, thread_id, text))
+                    return
+                except (OSError, TimeoutError, ValueError) as e:
+                    _log("turn/start failed; falling back to codex queue", {"err": str(e)})
+                    self.how = "codex queue (fallback)"
+            self.result = (True, _codex_queue(codex_cmd, thread_id, text))
+        except Exception as e:
+            self.result = (False, str(e))
+
+
 def _rpc_interrupt(codex_cmd: list[str], thread_id: str, turn_id: str) -> None:
     rpc = _AppServerRpc(codex_cmd)
     try:
@@ -613,7 +690,7 @@ class CodexLauncher:
         self._published_at = 0.0
         self._next_discovery = 0.0
         self._sizes: dict[str, int] = {}
-        self._inflight: dict[str, tuple[subprocess.Popen, float]] = {}
+        self._inflight: dict[str, _SendJob] = {}
         self._skips: set[str] = set()
         self._original_termios = None
         self._restored = False
@@ -711,26 +788,22 @@ class CodexLauncher:
     # -- outgoing -----------------------------------------------------------
 
     def _reap_inflight(self) -> None:
-        for path, (proc, started) in list(self._inflight.items()):
-            rc = proc.poll()
-            if rc is None:
-                if time.monotonic() - started > _QUEUE_TIMEOUT_SEC:
-                    proc.kill()
-                    proc.wait()
+        for path, job in list(self._inflight.items()):
+            if job.result is None:
+                if time.monotonic() - job.started > 2 * _QUEUE_TIMEOUT_SEC:
                     del self._inflight[path]
-                    _log("codex queue timed out", {"path": path})
-                    _fail(path, f"codex queue timed out after {_QUEUE_TIMEOUT_SEC:.0f}s")
+                    _log("send timed out", {"path": path, "via": job.how})
+                    _fail(path, f"{job.how} timed out")
                     _release(path)
                 continue
             del self._inflight[path]
-            out, err = proc.communicate()
-            if rc == 0:
-                _log("delivered", {"path": path, "out": out.strip()[-200:]})
+            ok, msg = job.result
+            if ok:
+                _log("delivered", {"path": path, "via": job.how, "out": msg})
                 _unlink(path)
             else:
-                msg = (err or out).strip().splitlines()
-                _log("codex queue failed", {"path": path, "rc": rc, "err": msg[-3:]})
-                _fail(path, f"codex queue exited {rc}: {msg[-1] if msg else ''}")
+                _log("send failed", {"path": path, "via": job.how, "err": msg})
+                _fail(path, f"{job.how} failed: {msg}")
             _release(path)
 
     def _process_outgoing(self) -> None:
@@ -817,23 +890,9 @@ class CodexLauncher:
             return
         # The Windows GUI sends CRLF line breaks.
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        try:
-            proc = subprocess.Popen(
-                [*self._codex_cmd, "queue", "--thread", sid, "--message", text],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **_quiet_popen_kwargs(),
-            )
-        except OSError as e:
-            _fail(path, f"could not run codex queue: {e}")
-            _release(path)
-            return
-        self._inflight[path] = (proc, time.monotonic())
-        _log("queued via codex queue", {"path": path, "chars": len(text)})
+        job = _SendJob(self._codex_cmd, sid, text, idle=self._status() == "idle")
+        self._inflight[path] = job
+        _log("sending", {"path": path, "via": job.how, "chars": len(text)})
 
     def _interrupt(self, sid: str) -> None:
         if self._mode == "pty":
@@ -929,11 +988,6 @@ class CodexLauncher:
             self._cleanup()
 
     def _cleanup(self) -> None:
-        for proc, _started in self._inflight.values():
-            try:
-                proc.kill()
-            except OSError:
-                pass
         try:
             os.unlink(self._state_path())
         except OSError:
