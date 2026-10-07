@@ -509,19 +509,30 @@ class CodexLauncher:
                 pass
 
     def _spawn(self) -> None:
-        pid, fd = pty.fork()
+        # Size the PTY from our terminal *before* Codex starts: a TUI that
+        # reads its size at startup and sees 0x0 draws nothing at all.
+        master, slave = pty.openpty()
+        try:
+            size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, size)
+        except OSError as e:
+            _log("could not copy terminal size", {"err": str(e)})
+        pid = os.fork()
         if pid == 0:
             try:
-                size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
-                fcntl.ioctl(0, termios.TIOCSWINSZ, size)
-            except OSError:
-                pass
-            try:
+                os.close(master)
+                os.setsid()
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+                for fd in (0, 1, 2):
+                    os.dup2(slave, fd)
+                if slave > 2:
+                    os.close(slave)
                 os.execvp(self._argv[0], self._argv)
             except OSError as e:
                 sys.stderr.write(f"clacogui_codex_launcher: exec {self._argv[0]!r} failed: {e}\n")
-                os._exit(127)
-        self._pid, self._master_fd = pid, fd
+            os._exit(127)
+        os.close(slave)
+        self._pid, self._master_fd = pid, master
 
     # -- main loop ----------------------------------------------------------
 
