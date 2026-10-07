@@ -804,24 +804,30 @@ def _merge_codex_config(text: str, cmd: str) -> str:
     positions -- Codex keys hook trust by position, so reordering them
     would ask the user to re-review hooks they already trusted.
     """
+    kept = ""
     begin = text.find(_CODEX_BLOCK_BEGIN)
     if begin >= 0:
-        end = text.find(_CODEX_BLOCK_END, begin)
-        if end < 0:
+        end_marker = text.find(_CODEX_BLOCK_END, begin)
+        if end_marker < 0:
             sys.exit(
                 "clacogui_agent: config.toml has the clacogui begin marker "
                 "but no end marker; fix it by hand and re-run."
             )
-        end += len(_CODEX_BLOCK_END)
-        if text[end:end + 1] == "\n":
-            end += 1
-        head = text[:begin]
-        # Drop the blank separator line we put in front of the block.
-        if head.endswith("\n\n"):
-            head = head[:-1]
-        text = head + text[end:]
-    body = text.rstrip("\n")
-    merged = (body + "\n\n" if body.strip() else "") + _codex_hook_block(cmd)
+        # Codex writes the trust it records for these hooks ([hooks.state])
+        # at the end of the document, which lands *inside* our block, just
+        # above the end-marker comment.  Keep every table we didn't write.
+        kept = _foreign_tables(text[begin + len(_CODEX_BLOCK_BEGIN):end_marker])
+        end = end_marker + len(_CODEX_BLOCK_END)
+        tail = text[end:].lstrip("\n")
+        # Rewrite the block where it is, so a re-run leaves the file as is.
+        merged = text[:begin] + _codex_hook_block(cmd)
+        if kept:
+            merged += "\n" + kept
+        if tail:
+            merged += "\n" + tail
+    else:
+        body = text.rstrip("\n")
+        merged = (body + "\n\n" if body.strip() else "") + _codex_hook_block(cmd)
     try:
         import tomllib
     except ModuleNotFoundError:
@@ -834,6 +840,24 @@ def _merge_codex_config(text: str, cmd: str) -> str:
             f"not parse ({e}).  Your existing file was left unchanged."
         )
     return merged
+
+
+def _foreign_tables(block_body: str) -> str:
+    """Tables inside the managed block that ``_codex_hook_block`` didn't emit."""
+    ours = set()
+    for event in _CODEX_HOOK_EVENTS:
+        ours.add(f"[[hooks.{event}]]")
+        ours.add(f"[[hooks.{event}.hooks]]")
+    out: list[str] = []
+    keep = False
+    for line in block_body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            keep = stripped not in ours
+        if keep:
+            out.append(line)
+    text = "\n".join(out).strip("\n")
+    return text + "\n" if text else ""
 
 
 def _cmd_install_codex(args) -> None:
