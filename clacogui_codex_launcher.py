@@ -256,6 +256,55 @@ def _unlink(path: str) -> None:
         _log("delete envelope failed", {"path": path, "err": str(e)})
 
 
+def _claim(path: str) -> bool:
+    """Take ``<envelope>.lock`` so only one launcher delivers an envelope.
+
+    Several TUIs (each under its own launcher) can be attached to the same
+    thread; without this every one of them would send the message.  The
+    lock name doesn't end in ``.json``, so the GUI ignores it and still
+    reads "envelope gone" as delivered.  A lock left by a launcher that
+    died is broken so the envelope isn't stranded.
+    """
+    lock = path + ".lock"
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                with open(lock, encoding="utf-8") as f:
+                    owner = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                return False
+            if owner == os.getpid():
+                return True
+            try:
+                os.kill(owner, 0)
+                return False
+            except ProcessLookupError:
+                _log("breaking stale envelope lock", {"path": path, "owner": owner})
+                try:
+                    os.unlink(lock)
+                except OSError:
+                    return False
+                continue
+            except PermissionError:
+                return False
+        except OSError as e:
+            _log("could not create envelope lock", {"path": path, "err": str(e)})
+            return False
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    return False
+
+
+def _release(path: str) -> None:
+    try:
+        os.unlink(path + ".lock")
+    except OSError:
+        pass
+
+
 def _envelope_age_sec(path: str) -> float:
     try:
         return time.time() - int(os.path.basename(path).split("_", 1)[0]) / 1000
@@ -390,6 +439,7 @@ class CodexLauncher:
                     del self._inflight[path]
                     _log("codex queue timed out", {"path": path})
                     _fail(path, f"codex queue timed out after {_QUEUE_TIMEOUT_SEC:.0f}s")
+                    _release(path)
                 continue
             del self._inflight[path]
             out, err = proc.communicate()
@@ -400,6 +450,7 @@ class CodexLauncher:
                 msg = (err or out).strip().splitlines()
                 _log("codex queue failed", {"path": path, "rc": rc, "err": msg[-3:]})
                 _fail(path, f"codex queue exited {rc}: {msg[-1] if msg else ''}")
+            _release(path)
 
     def _process_outgoing(self) -> None:
         self._reap_inflight()
@@ -421,58 +472,85 @@ class CodexLauncher:
                 if self._sizes.get(path) != size:
                     self._sizes[path] = size
                     continue
-                _fail(path, f"could not parse JSON envelope (file size {size} bytes)")
+                self._fail_claimed(path, f"could not parse JSON envelope (file size {size} bytes)")
                 continue
             if _envelope_age_sec(path) > _OUTGOING_MAX_AGE_SEC:
-                _fail(path, f"stale outgoing file (older than {_OUTGOING_MAX_AGE_SEC}s)")
+                self._fail_claimed(path, f"stale outgoing file (older than {_OUTGOING_MAX_AGE_SEC}s)")
                 continue
             sid = envelope.get("session_id")
             if not sid:
-                _fail(path, "envelope has no session_id")
+                self._fail_claimed(path, "envelope has no session_id")
                 continue
             if sid != self._session_id:
                 if path not in self._skips:
                     _log("skip: session_id mismatch", {"path": path, "envelope_sid": sid, "our_sid": self._session_id})
                     self._skips.add(path)
                 continue
-
-            action = envelope.get("action")
-            if action == "interrupt":
-                if self._status() == "busy":
-                    try:
-                        os.write(self._master_fd, _ESC)
-                    except OSError as e:
-                        _fail(path, f"interrupt write failed: {e}")
-                        continue
-                    _log("delivered interrupt", {"path": path})
-                else:
-                    _log("interrupt ignored: no turn running", {"path": path})
-                _unlink(path)
+            if not _claim(path):
+                # Another launcher on this thread is delivering it.
                 continue
-            if action not in (None, "", "send"):
-                _fail(path, f"unknown action: {action!r}")
+            if not os.path.exists(path):
+                # It finished delivering between our read and our claim (it
+                # deletes the envelope before releasing the lock).
+                _release(path)
                 continue
-            text = envelope.get("text")
-            if not isinstance(text, str) or not text.strip():
-                _fail(path, "envelope has no 'text' string")
-                continue
-            # The Windows GUI sends CRLF line breaks.
-            text = text.replace("\r\n", "\n").replace("\r", "\n")
-            codex = shutil.which("codex") or self._argv[0]
             try:
-                proc = subprocess.Popen(
-                    [codex, "queue", "--thread", sid, "--message", text],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                )
-            except OSError as e:
-                _fail(path, f"could not run codex queue: {e}")
-                continue
-            self._inflight[path] = (proc, time.monotonic())
-            _log("queued via codex queue", {"path": path, "chars": len(text)})
+                self._deliver(path, envelope, sid)
+            except Exception as e:
+                _log("deliver crashed", {"path": path, "err": repr(e)})
+                _release(path)
+
+    def _fail_claimed(self, path: str, error: str) -> None:
+        if _claim(path):
+            if os.path.exists(path):
+                _fail(path, error)
+            _release(path)
+
+    def _deliver(self, path: str, envelope: dict, sid: str) -> None:
+        """Act on one claimed envelope.  The lock is released here, except
+        for a send, where it stays held until ``_reap_inflight`` sees
+        ``codex queue`` finish."""
+        action = envelope.get("action")
+        if action == "interrupt":
+            if self._status() == "busy":
+                try:
+                    os.write(self._master_fd, _ESC)
+                    _log("delivered interrupt", {"path": path})
+                    _unlink(path)
+                except OSError as e:
+                    _fail(path, f"interrupt write failed: {e}")
+            else:
+                _log("interrupt ignored: no turn running", {"path": path})
+                _unlink(path)
+            _release(path)
+            return
+        if action not in (None, "", "send"):
+            _fail(path, f"unknown action: {action!r}")
+            _release(path)
+            return
+        text = envelope.get("text")
+        if not isinstance(text, str) or not text.strip():
+            _fail(path, "envelope has no 'text' string")
+            _release(path)
+            return
+        # The Windows GUI sends CRLF line breaks.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        codex = shutil.which("codex") or self._argv[0]
+        try:
+            proc = subprocess.Popen(
+                [codex, "queue", "--thread", sid, "--message", text],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError as e:
+            _fail(path, f"could not run codex queue: {e}")
+            _release(path)
+            return
+        self._inflight[path] = (proc, time.monotonic())
+        _log("queued via codex queue", {"path": path, "chars": len(text)})
 
     # -- terminal plumbing --------------------------------------------------
 
