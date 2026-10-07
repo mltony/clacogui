@@ -934,6 +934,20 @@ def _install_codex_local(target, remote_script, agent_bytes, launcher_bytes, dir
     print(f"[clacogui_agent] Updated {config_path}")
 
 
+def _ftp_upload_path(remote_script: str, root: str) -> str:
+    """Where to STOR the agent over FTP.
+
+    ``--remote-script`` is the path the *hook command* uses on the Codex
+    machine.  A Unix absolute path is also a valid FTP path; a Windows
+    one (``C:/Users/me/.codex/x.py``) is not, so that file goes into the
+    target folder under the same name.
+    """
+    if remote_script.startswith("/"):
+        return remote_script
+    name = remote_script.replace("\\", "/").rsplit("/", 1)[-1] or "clacogui_agent.py"
+    return f"{root.rstrip('/')}/{name}"
+
+
 def _install_codex_ftp(url, remote_script, agent_bytes, launcher_bytes, dirs, cmd) -> None:
     import ftplib
     import io
@@ -956,9 +970,10 @@ def _install_codex_ftp(url, remote_script, agent_bytes, launcher_bytes, dirs, cm
     ftp.set_pasv(True)
     print(f"[clacogui_agent] FTP Codex install into {u.hostname}:{u.port or 21}{root}")
     try:
-        remote_dir = remote_script.rsplit("/", 1)[0] or root
+        agent_ftp = _ftp_upload_path(remote_script, root)
+        remote_dir = agent_ftp.rsplit("/", 1)[0] or root
         for remote, body in (
-            (remote_script, agent_bytes),
+            (agent_ftp, agent_bytes),
             (f"{remote_dir}/{CODEX_LAUNCHER_NAME}", launcher_bytes),
         ):
             print(f"[clacogui_agent] Uploading {remote}")
