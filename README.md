@@ -502,6 +502,29 @@ python3 ~/.codex/clacogui_codex_launcher.py                 # new thread
 python3 ~/.codex/clacogui_codex_launcher.py resume <id|name>
 ```
 
+#### Windows, and choosing how interrupts are sent
+
+The launcher also runs on Windows (Codex in Windows Terminal).  Pick how
+the GUI's interrupt reaches Codex with `--interrupt MODE` (or the
+`CLACOGUI_CODEX_INTERRUPT` environment variable); the flag is the
+launcher's own and is not passed to codex:
+
+| Mode | Platforms | How it works |
+| --- | --- | --- |
+| `pty` | Linux, macOS (default there) | Codex runs under the launcher's PTY; interrupt types Esc into it. |
+| `console` | Windows (default there) | Codex runs directly in the same console window; interrupt writes an Esc key event into the console's input queue. |
+| `rpc` | any | Codex runs directly in the terminal; interrupt calls the Codex app-server's `turn/interrupt` through `codex app-server proxy`. |
+
+```bat
+python %USERPROFILE%\.codex\clacogui_codex_launcher.py resume <id|name>
+python %USERPROFILE%\.codex\clacogui_codex_launcher.py --interrupt rpc resume <id|name>
+```
+
+On Windows, install the hooks with an interpreter and an absolute script
+path Windows can run, e.g. `install_agent.cmd --codex
+ftp://...@host:2121/Users/me/.codex --python python --remote-script
+C:/Users/me/.codex/clacogui_agent.py --yes`.
+
 What changes compared to Claude:
 
 - **Status bar** field 0 reads `Codex: idle` / `Codex: busy` from the

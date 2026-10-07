@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""clacogui_codex_launcher - transparent PTY parent for the Codex CLI.
+"""clacogui_codex_launcher - clacogui side channel for the Codex CLI.
 
 Run *instead of* ``codex``::
 
     python3 ~/.codex/clacogui_codex_launcher.py [args passed to codex...]
     python3 ~/.codex/clacogui_codex_launcher.py resume <thread-id-or-name>
+    python clacogui_codex_launcher.py --interrupt rpc [args passed to codex...]
+
+``--interrupt MODE`` (or ``$CLACOGUI_CODEX_INTERRUPT``) picks how the GUI's
+interrupt reaches Codex; the flag is consumed, not passed to codex:
+
+* ``pty`` (default on Linux/macOS) -- Codex runs under our PTY and gets
+  an Esc typed into it.
+* ``console`` (default on Windows) -- Codex runs directly in this
+  console window and gets an Esc key event written into the console's
+  input queue.
+* ``rpc`` (any OS) -- Codex runs directly in this terminal and the turn is
+  stopped with the app-server ``turn/interrupt`` request, sent through
+  ``codex app-server proxy``.
+
+In ``console`` and ``rpc`` mode nothing sits between your keyboard and
+Codex; the launcher only runs the side channel next to it.
 
 Your terminal renders the Codex TUI exactly as before; keystrokes pass
 straight through.  On a 200 ms side channel the launcher also:
@@ -14,9 +30,9 @@ straight through.  On a 200 ms side channel the launcher also:
 * delivers GUI messages from ``$CODEX_HOME/clacogui_outgoing/<id>.json``
   with ``codex queue --thread <id> --message <text>`` -- Codex queues it
   behind a running turn by itself, so nothing is typed into the TUI;
-* turns an ``action: interrupt`` envelope into one Esc on the PTY, only
-  while a turn is running (a second Esc at an idle Codex prompt opens
-  "edit previous message").
+* turns an ``action: interrupt`` envelope into an interrupt (see above),
+  only while a turn is running (a second Esc at an idle Codex prompt
+  opens "edit previous message").
 
 Envelope format and outcome signalling match ``clacogui_launcher.py``:
 the file is deleted once delivered, or renamed to ``<id>.json.failed``
@@ -27,22 +43,33 @@ Stdlib only, so it can be dropped into any container.
 
 from __future__ import annotations
 
+import base64
 import errno
-import fcntl
 import glob
 import json
 import os
-import pty
+import queue
 import re
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
-import termios
+import threading
 import time
-import tty
 from typing import Optional
+
+_IS_WINDOWS = sys.platform == "win32"
+try:
+    import fcntl
+    import pty
+    import termios
+    import tty
+except ImportError:  # Windows: only the console / rpc modes are available.
+    fcntl = pty = termios = tty = None  # type: ignore[assignment]
+
+INTERRUPT_MODES = ("pty", "console", "rpc")
 
 OUTGOING_DIR = "clacogui_outgoing"
 STATE_DIR = "clacogui_sessions"
@@ -87,6 +114,62 @@ def _log(label: str, payload: object = None) -> None:
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` is running.  Never signals it: on Windows
+    ``os.kill(pid, 0)`` would terminate the process."""
+    if pid <= 0:
+        return False
+    if _IS_WINDOWS:
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # access denied: it exists
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(handle))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _codex_command() -> Optional[list[str]]:
+    """How to run ``codex``, as an argv prefix.
+
+    On Windows npm installs a ``codex.cmd`` shim; running it goes through
+    cmd.exe, which re-parses the arguments (``& | % ^ "``) and would mangle
+    message text.  Call node on the package's own script instead.
+    """
+    path = shutil.which("codex")
+    if not path:
+        return None
+    if _IS_WINDOWS and path.lower().endswith((".cmd", ".bat", ".ps1")):
+        base = os.path.dirname(path)
+        script = os.path.join(base, "node_modules", "@openai", "codex", "bin", "codex.js")
+        node = shutil.which("node") or os.path.join(base, "node.exe")
+        if os.path.isfile(script) and os.path.isfile(node):
+            return [node, script]
+        _log("using the codex.cmd shim; message text may be re-parsed by cmd.exe", {"path": path})
+    return [path]
+
+
+def _quiet_popen_kwargs() -> dict:
+    """Keep helper processes off our terminal / console."""
+    if _IS_WINDOWS:
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {"start_new_session": True}
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
@@ -148,11 +231,10 @@ def _claimed_by_others() -> set[str]:
             continue
         try:
             pid = int(name[:-5])
-            os.kill(pid, 0)
-        except (ValueError, ProcessLookupError):
+        except ValueError:
             continue
-        except PermissionError:
-            pass
+        if not _pid_alive(pid):
+            continue
         try:
             with open(os.path.join(d, name), encoding="utf-8") as f:
                 sid = json.load(f).get("sessionId")
@@ -174,11 +256,16 @@ class TurnTracker:
     def __init__(self, path: str) -> None:
         self.path = path
         self.offset = 0
-        self.open_turns: set[str] = set()
+        # Insertion-ordered, so the newest open turn is the last key.
+        self.open_turns: dict[str, None] = {}
 
     @property
     def busy(self) -> bool:
         return bool(self.open_turns)
+
+    @property
+    def current_turn(self) -> Optional[str]:
+        return next(reversed(self.open_turns), None) if self.open_turns else None
 
     def poll(self) -> None:
         try:
@@ -201,9 +288,9 @@ class TurnTracker:
                 continue
             ptype = payload.get("type")
             if ptype == "task_started":
-                self.open_turns.add(payload.get("turn_id") or "")
+                self.open_turns[payload.get("turn_id") or ""] = None
             elif ptype in ("task_complete", "turn_aborted"):
-                self.open_turns.discard(payload.get("turn_id") or "")
+                self.open_turns.pop(payload.get("turn_id") or "", None)
 
 
 # ---------------------------------------------------------------------------
@@ -277,18 +364,14 @@ def _claim(path: str) -> bool:
                 return False
             if owner == os.getpid():
                 return True
+            if _pid_alive(owner):
+                return False
+            _log("breaking stale envelope lock", {"path": path, "owner": owner})
             try:
-                os.kill(owner, 0)
+                os.unlink(lock)
+            except OSError:
                 return False
-            except ProcessLookupError:
-                _log("breaking stale envelope lock", {"path": path, "owner": owner})
-                try:
-                    os.unlink(lock)
-                except OSError:
-                    return False
-                continue
-            except PermissionError:
-                return False
+            continue
         except OSError as e:
             _log("could not create envelope lock", {"path": path, "err": str(e)})
             return False
@@ -313,13 +396,211 @@ def _envelope_age_sec(path: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Interrupt transports for the non-PTY modes
+# ---------------------------------------------------------------------------
+
+
+def _console_send_escape() -> None:
+    """Write an Esc key press into this console's input queue (Windows).
+
+    Codex shares our console in ``console`` mode and reads key events from
+    the same queue, so it sees this exactly as if Esc had been pressed.
+    Fixed-width field types keep the structs at their Windows sizes
+    (KEY_EVENT_RECORD 16 bytes, INPUT_RECORD 20).
+    """
+    import ctypes
+
+    class KEY_EVENT_RECORD(ctypes.Structure):
+        _fields_ = [
+            ("bKeyDown", ctypes.c_int32),
+            ("wRepeatCount", ctypes.c_uint16),
+            ("wVirtualKeyCode", ctypes.c_uint16),
+            ("wVirtualScanCode", ctypes.c_uint16),
+            ("UnicodeChar", ctypes.c_uint16),
+            ("dwControlKeyState", ctypes.c_uint32),
+        ]
+
+    class _EVENT(ctypes.Union):
+        _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("_pad", ctypes.c_byte * 16)]
+
+    class INPUT_RECORD(ctypes.Structure):
+        _fields_ = [("EventType", ctypes.c_uint16), ("Event", _EVENT)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    k32.WriteConsoleInputW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(INPUT_RECORD), ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    # CONIN$ is this console's input even if our stdin was redirected.
+    handle = k32.CreateFileW(
+        "CONIN$", 0x80000000 | 0x40000000, 0x1 | 0x2, None, 3, 0, None
+    )
+    if not handle or handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "could not open the console input (CONIN$)")
+    try:
+        records = (INPUT_RECORD * 2)()
+        for rec, down in zip(records, (1, 0)):
+            rec.EventType = 0x0001  # KEY_EVENT
+            key = rec.Event.KeyEvent
+            key.bKeyDown = down
+            key.wRepeatCount = 1
+            key.wVirtualKeyCode = 0x1B  # VK_ESCAPE
+            key.wVirtualScanCode = 0x01
+            key.UnicodeChar = 0x1B
+        written = ctypes.c_uint32()
+        if not k32.WriteConsoleInputW(handle, records, 2, ctypes.byref(written)):
+            raise OSError(ctypes.get_last_error(), "WriteConsoleInputW failed")
+    finally:
+        k32.CloseHandle(handle)
+
+
+class _AppServerRpc:
+    """JSON-RPC to the running Codex app-server through ``codex app-server proxy``.
+
+    The proxy relays raw bytes to the app-server's control socket, which
+    speaks WebSocket, so this does the upgrade handshake and text framing
+    itself.  A reader thread (rather than ``select``) keeps it working on
+    Windows pipes.
+    """
+
+    def __init__(self, codex_cmd: list[str], timeout: float = 10.0) -> None:
+        self._proc = subprocess.Popen(
+            [*codex_cmd, "app-server", "proxy"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            **_quiet_popen_kwargs(),
+        )
+        self._buf = b""
+        self._chunks: "queue.Queue[bytes]" = queue.Queue()
+        threading.Thread(target=self._read_loop, daemon=True).start()
+        self._next_id = 1
+        key = base64.b64encode(os.urandom(16)).decode()
+        self._write(
+            (
+                "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode()
+        )
+        deadline = time.monotonic() + timeout
+        while b"\r\n\r\n" not in self._buf:
+            self._fill(deadline)
+        head, self._buf = self._buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0] + b" ":
+            raise OSError(f"app-server refused the WebSocket upgrade: {head[:120]!r}")
+
+    def _read_loop(self) -> None:
+        while True:
+            try:
+                data = self._proc.stdout.read1(65536)
+            except (OSError, ValueError):
+                data = b""
+            self._chunks.put(data)
+            if not data:
+                return
+
+    def _fill(self, deadline: float) -> None:
+        left = deadline - time.monotonic()
+        try:
+            data = self._chunks.get(timeout=max(left, 0.0))
+        except queue.Empty:
+            raise TimeoutError("Codex app-server did not answer in time") from None
+        if not data:
+            raise OSError("codex app-server proxy closed the connection")
+        self._buf += data
+
+    def _write(self, data: bytes) -> None:
+        self._proc.stdin.write(data)
+        self._proc.stdin.flush()
+
+    def _send(self, obj: dict) -> None:
+        data = json.dumps(obj).encode()
+        mask = os.urandom(4)
+        n = len(data)
+        if n < 126:
+            head = bytes([0x81, 0x80 | n])
+        elif n < 65536:
+            head = bytes([0x81, 0x80 | 126]) + struct.pack(">H", n)
+        else:
+            head = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", n)
+        self._write(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv(self, deadline: float):
+        while True:
+            while len(self._buf) < 2:
+                self._fill(deadline)
+            n, off = self._buf[1] & 0x7F, 2
+            if n == 126:
+                while len(self._buf) < 4:
+                    self._fill(deadline)
+                n, off = struct.unpack(">H", self._buf[2:4])[0], 4
+            elif n == 127:
+                while len(self._buf) < 10:
+                    self._fill(deadline)
+                n, off = struct.unpack(">Q", self._buf[2:10])[0], 10
+            while len(self._buf) < off + n:
+                self._fill(deadline)
+            opcode = self._buf[0] & 0x0F
+            payload, self._buf = self._buf[off:off + n], self._buf[off + n:]
+            if opcode == 0x8:
+                raise OSError("Codex app-server closed the connection")
+            if opcode in (0x1, 0x2):
+                return json.loads(payload)
+
+    def call(self, method: str, params: dict, timeout: float = 10.0) -> dict:
+        rid = self._next_id
+        self._next_id += 1
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            msg = self._recv(deadline)
+            if isinstance(msg, dict) and msg.get("id") == rid:
+                if "error" in msg:
+                    raise OSError(f"{method} failed: {msg['error']}")
+                return msg.get("result") or {}
+
+    def notify(self, method: str) -> None:
+        self._send({"jsonrpc": "2.0", "method": method})
+
+    def close(self) -> None:
+        try:
+            self._proc.kill()
+            self._proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _rpc_interrupt(codex_cmd: list[str], thread_id: str, turn_id: str) -> None:
+    rpc = _AppServerRpc(codex_cmd)
+    try:
+        rpc.call("initialize", {"clientInfo": {"name": "clacogui", "version": "1"}})
+        rpc.notify("initialized")
+        rpc.call("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+    finally:
+        rpc.close()
+
+
+# ---------------------------------------------------------------------------
 # Launcher
 # ---------------------------------------------------------------------------
 
 
 class CodexLauncher:
-    def __init__(self, codex_argv: list[str]) -> None:
-        self._argv = codex_argv
+    def __init__(
+        self, codex_cmd: list[str], codex_args: list[str], mode: str = "pty"
+    ) -> None:
+        self._codex_cmd = codex_cmd
+        self._codex_args = codex_args
+        self._argv = [*codex_cmd, *codex_args]
+        self._mode = mode
+        self._child: Optional[subprocess.Popen] = None
         self._master_fd = -1
         self._pid = -1
         self._started_wall = time.time()
@@ -514,11 +795,12 @@ class CodexLauncher:
         if action == "interrupt":
             if self._status() == "busy":
                 try:
-                    os.write(self._master_fd, _ESC)
-                    _log("delivered interrupt", {"path": path})
+                    self._interrupt(sid)
+                    _log("delivered interrupt", {"path": path, "via": self._mode})
                     _unlink(path)
-                except OSError as e:
-                    _fail(path, f"interrupt write failed: {e}")
+                except (OSError, TimeoutError) as e:
+                    _log("interrupt failed", {"path": path, "via": self._mode, "err": str(e)})
+                    _fail(path, f"interrupt via {self._mode} failed: {e}")
             else:
                 _log("interrupt ignored: no turn running", {"path": path})
                 _unlink(path)
@@ -535,15 +817,16 @@ class CodexLauncher:
             return
         # The Windows GUI sends CRLF line breaks.
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        codex = shutil.which("codex") or self._argv[0]
         try:
             proc = subprocess.Popen(
-                [codex, "queue", "--thread", sid, "--message", text],
+                [*self._codex_cmd, "queue", "--thread", sid, "--message", text],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                start_new_session=True,
+                encoding="utf-8",
+                errors="replace",
+                **_quiet_popen_kwargs(),
             )
         except OSError as e:
             _fail(path, f"could not run codex queue: {e}")
@@ -551,6 +834,17 @@ class CodexLauncher:
             return
         self._inflight[path] = (proc, time.monotonic())
         _log("queued via codex queue", {"path": path, "chars": len(text)})
+
+    def _interrupt(self, sid: str) -> None:
+        if self._mode == "pty":
+            os.write(self._master_fd, _ESC)
+        elif self._mode == "console":
+            _console_send_escape()
+        else:
+            turn = self._tracker.current_turn if self._tracker is not None else None
+            if not turn:
+                raise OSError("no running turn id in the rollout")
+            _rpc_interrupt(self._codex_cmd, sid, turn)
 
     # -- terminal plumbing --------------------------------------------------
 
@@ -615,13 +909,15 @@ class CodexLauncher:
     # -- main loop ----------------------------------------------------------
 
     def run(self) -> int:
-        hint = _argv_thread_hint(self._argv[1:])
+        hint = _argv_thread_hint(self._codex_args)
         if hint:
             self._hint_id = hint.lower() if _UUID_RE.match(hint) else _thread_id_for_name(hint)
         self._baseline_rollouts = _rollout_paths()
         self._started_wall = time.time()
+        if self._mode != "pty":
+            return self._run_direct(hint)
         self._spawn()
-        _log("spawned codex", {"pid": self._pid, "argv": self._argv, "hint": hint})
+        _log("spawned codex", {"pid": self._pid, "argv": self._argv, "hint": hint, "mode": "pty"})
         self._enter_raw_mode()
         signal.signal(signal.SIGWINCH, self._handle_winch)
         signal.signal(signal.SIGHUP, self._handle_term)
@@ -630,15 +926,43 @@ class CodexLauncher:
             return self._select_loop()
         finally:
             self._restore_terminal()
-            for proc, _started in self._inflight.values():
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+            self._cleanup()
+
+    def _cleanup(self) -> None:
+        for proc, _started in self._inflight.values():
             try:
-                os.unlink(self._state_path())
+                proc.kill()
             except OSError:
                 pass
+        try:
+            os.unlink(self._state_path())
+        except OSError:
+            pass
+
+    def _run_direct(self, hint: Optional[str]) -> int:
+        """``console`` / ``rpc``: Codex owns this terminal; we only watch.
+
+        Ctrl+C reaches every process attached to the terminal, so ignore it
+        here -- it is Codex's to handle.
+        """
+        self._child = subprocess.Popen(self._argv)
+        self._pid = self._child.pid
+        _log("spawned codex", {"pid": self._pid, "argv": self._argv, "hint": hint, "mode": self._mode})
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if not _IS_WINDOWS:
+            signal.signal(signal.SIGHUP, self._handle_term)
+            signal.signal(signal.SIGTERM, self._handle_term)
+        try:
+            while self._child.poll() is None:
+                try:
+                    self._tick()
+                except Exception as e:
+                    _log("tick crashed", {"err": repr(e)})
+                time.sleep(_TICK_SEC)
+        finally:
+            self._cleanup()
+        rc = self._child.returncode
+        return 128 - rc if rc < 0 else rc
 
     def _tick(self) -> None:
         self._discover()
@@ -700,8 +1024,46 @@ class CodexLauncher:
         return 0
 
 
+def _split_args(args: list[str]) -> tuple[str, list[str]]:
+    """Take ``--interrupt MODE`` / ``--interrupt=MODE`` out of the codex args."""
+    mode = os.environ.get("CLACOGUI_CODEX_INTERRUPT") or ("console" if _IS_WINDOWS else "pty")
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--interrupt" and i + 1 < len(args):
+            mode = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--interrupt="):
+            mode = a.split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    return mode, rest
+
+
 def main(argv: list[str]) -> int:
-    codex = shutil.which("codex")
+    mode, codex_args = _split_args(argv[1:])
+    if mode not in INTERRUPT_MODES:
+        sys.stderr.write(
+            f"clacogui_codex_launcher: --interrupt must be one of {', '.join(INTERRUPT_MODES)}\n"
+        )
+        return 2
+    if mode == "pty" and pty is None:
+        sys.stderr.write(
+            "clacogui_codex_launcher: --interrupt pty needs a Unix terminal; "
+            "on Windows use --interrupt console or --interrupt rpc.\n"
+        )
+        return 2
+    if mode == "console" and not _IS_WINDOWS:
+        sys.stderr.write(
+            "clacogui_codex_launcher: --interrupt console is Windows-only; "
+            "use pty or rpc.\n"
+        )
+        return 2
+    codex = _codex_command()
     if not codex:
         sys.stderr.write("clacogui_codex_launcher: could not find 'codex' on PATH.\n")
         return 127
@@ -710,7 +1072,7 @@ def main(argv: list[str]) -> int:
             os.makedirs(os.path.join(_codex_home(), d), exist_ok=True)
         except OSError as e:
             _log("could not create dir", {"dir": d, "err": str(e)})
-    return CodexLauncher([codex, *argv[1:]]).run()
+    return CodexLauncher(codex, codex_args, mode).run()
 
 
 if __name__ == "__main__":
