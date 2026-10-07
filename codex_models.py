@@ -43,10 +43,11 @@ SESSIONS_DIR = "sessions"
 SESSION_INDEX = "session_index.jsonl"
 LAUNCHER_SESSIONS_DIR = "clacogui_sessions"
 
-# Launcher state files are rewritten at least this often while the
-# launcher runs; anything older belongs to a launcher that died without
-# cleaning up.
-LAUNCHER_STALE_SEC = 120
+# The launcher rewrites its state file every 30 s and deletes it on exit;
+# anything older than this belongs to one that died without cleaning up.
+# Generous so clock skew between the GUI host and the Codex host can't
+# hide a live launcher.
+LAUNCHER_STALE_SEC = 600
 
 # The open dialog only walks this many of the newest day directories
 # unless the user asks for everything -- each directory listing is a
