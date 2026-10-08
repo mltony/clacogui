@@ -36,7 +36,7 @@ except ImportError:  # not on Windows; we'll fall back to wx.Bell
     winsound = None  # type: ignore[assignment]
 
 import models
-from fs import FsBackend, make_backend
+from fs import FsBackend, FtpBackend, make_backend
 
 # Directory names mirrored from clacogui_agent.py.  Kept inline (rather than
 # imported) so we don't drag the agent's argparse dependencies into the GUI.
@@ -316,6 +316,7 @@ CONFIG_PATH = os.path.join(
 )
 
 POLL_INTERVAL_MS = 200
+PENDING_TAB_RETRY_SEC = 15.0
 ACTIVE_POLL_INTERVAL_MS = 200
 
 # Conversation sources.  Claude Code is the original (``claude_dir`` in
@@ -548,11 +549,39 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    # Written whole and swapped in: another clacogui window may read the
+    # file at any moment, and a torn read comes back as an empty config.
+    tmp = f"{CONFIG_PATH}.{os.getpid()}.tmp"
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, CONFIG_PATH)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
     except OSError:
         log.exception("Could not save config to %s", CONFIG_PATH)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def folder_key(backend: Optional[FsBackend]) -> str:
+    """Identity of a folder for remembering its open tabs.
+
+    FTP leaves out the host: ``run.cmd`` points at WSL, whose address
+    changes on every boot.
+    """
+    if backend is None:
+        return ""
+    if isinstance(backend, FtpBackend):
+        return f"ftp://{backend.user}@:{backend.port}{backend.root or '/'}"
+    return os.path.normcase(os.path.abspath(backend.display_root()))
 
 
 # ---------------------------------------------------------------------------
@@ -3151,6 +3180,11 @@ class MainFrame(wx.Frame):
             except Exception:
                 log.exception("Could not build Codex backend from %r", codex_spec)
                 self.codex_spec = None
+        # Saved tabs whose folder could not be reached at startup; retried
+        # from the timer and kept in the saved list until then.
+        self._pending_tabs: list[dict] = []
+        self._pending_checking = False
+        self._pending_retry_at = 0.0
         self._build_menu()
         self._build_ui()
         self._build_accelerators()
@@ -3771,7 +3805,6 @@ class MainFrame(wx.Frame):
     def _on_close(self, event: wx.CloseEvent) -> None:
         log.info("MainFrame closing")
         try:
-            open_tabs = []
             # Every tab with its source, in tab order.  ``open_tabs`` keeps
             # listing the Claude ones on their own so an older clacogui can
             # still restore them.
@@ -3782,13 +3815,26 @@ class MainFrame(wx.Frame):
                     open_tabs_v2.append(
                         {"provider": page.provider, "rel": page.rel_path}
                     )
-                    if not page.is_codex:
-                        open_tabs.append(page.rel_path)
+            for entry in self._pending_tabs:
+                if entry not in open_tabs_v2:
+                    open_tabs_v2.append(entry)
+            open_tabs = [
+                e["rel"] for e in open_tabs_v2 if e["provider"] != PROVIDER_CODEX
+            ]
             active_idx = self.notebook.GetSelection()
+            if active_idx == wx.NOT_FOUND:
+                active_idx = 0
+            # Re-read so tabs other windows saved since startup survive; this
+            # window only replaces the entry for its own folders.
             cfg = load_config()
+            store = cfg.get("tabs_by_folder")
+            if not isinstance(store, dict):
+                store = {}
+            store[self.tab_store_key()] = {"tabs": open_tabs_v2, "active": active_idx}
+            cfg["tabs_by_folder"] = store
             cfg["open_tabs"] = open_tabs
             cfg["open_tabs_v2"] = open_tabs_v2
-            cfg["active_tab_index"] = active_idx if active_idx != wx.NOT_FOUND else 0
+            cfg["active_tab_index"] = active_idx
             save_config(cfg)
         except Exception:
             log.debug("Failed to save open tabs", exc_info=True)
@@ -3821,6 +3867,132 @@ class MainFrame(wx.Frame):
             self._poll_codex_agent()
         except Exception:
             log.exception("Codex agent poll crashed")
+        if (
+            self._pending_tabs
+            and not self._pending_checking
+            and time.monotonic() >= self._pending_retry_at
+        ):
+            self.restore_tabs(list(self._pending_tabs))
+
+    def tab_store_key(self) -> str:
+        return f"{folder_key(self.backend)} | {folder_key(self.codex_backend)}"
+
+    def restore_tabs(self, entries: list, active_idx: Optional[int] = None) -> None:
+        """Open saved tabs whose files exist, off the UI thread.
+
+        A tab is dropped only when its folder answers and the file is gone.
+        If the folder can't be reached the tab goes to ``_pending_tabs`` and
+        opens once it can.  ``active_idx`` (startup only) indexes ``entries``.
+        """
+        jobs = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            provider = entry.get("provider") or PROVIDER_CLAUDE
+            rel_path = entry.get("rel")
+            backend = self.codex_backend if provider == PROVIDER_CODEX else self.backend
+            if backend is None or not isinstance(rel_path, str):
+                continue
+            jobs.append(({"provider": provider, "rel": rel_path}, backend))
+        if not jobs:
+            self._pending_tabs = []
+            return
+        active_entry = None
+        if active_idx is not None and 0 <= active_idx < len(entries):
+            e = entries[active_idx]
+            if isinstance(e, dict):
+                active_entry = {
+                    "provider": e.get("provider") or PROVIDER_CLAUDE, "rel": e.get("rel")
+                }
+        self._pending_checking = True
+
+        def work():
+            # Probe each folder root first: a vanished SMB share or FTP chroot
+            # also says "file not found", which must not drop the tab.
+            reachable: dict[int, bool] = {}
+            states = []
+            for entry, backend in jobs:
+                if id(backend) not in reachable:
+                    try:
+                        backend.list_dir("")
+                        reachable[id(backend)] = True
+                    except OSError as exc:
+                        log.info(
+                            "Folder %s unreachable while restoring tabs: %s",
+                            backend.display_root(), exc,
+                        )
+                        reachable[id(backend)] = False
+                if not reachable[id(backend)]:
+                    states.append("unreachable")
+                    continue
+                try:
+                    backend.stat(entry["rel"])
+                    states.append("ok")
+                except FileNotFoundError:
+                    states.append("missing")
+                except OSError:
+                    states.append("unreachable")
+            return states
+
+        def on_done(states, exc):
+            if not self:
+                return
+            self._pending_checking = False
+            self._pending_retry_at = time.monotonic() + PENDING_TAB_RETRY_SEC
+            if exc is not None:
+                log.debug("Tab restore check failed", exc_info=exc)
+                states = ["unreachable"] * len(jobs)
+            pending = []
+            had_pages = self.notebook.GetPageCount() > 0
+            for (entry, backend), state in zip(jobs, states):
+                if state == "missing":
+                    log.debug("Dropping saved tab, file is gone: %s", entry["rel"])
+                    continue
+                if state == "unreachable":
+                    pending.append(entry)
+                    continue
+                if backend is not (
+                    self.codex_backend if entry["provider"] == PROVIDER_CODEX
+                    else self.backend
+                ):
+                    continue  # folder changed while the check ran
+                if any(
+                    isinstance(p, ConversationPanel)
+                    and p.backend is backend
+                    and p.rel_path == entry["rel"]
+                    for p in (
+                        self.notebook.GetPage(i)
+                        for i in range(self.notebook.GetPageCount())
+                    )
+                ):
+                    continue
+                try:
+                    panel = ConversationPanel(
+                        self.notebook, backend, entry["rel"], entry["provider"]
+                    )
+                    self.notebook.AddPage(
+                        panel, panel.conversation_name(), select=entry == active_entry
+                    )
+                except Exception:
+                    log.debug("Failed to restore tab %s", entry["rel"], exc_info=True)
+            self._pending_tabs = pending
+            count = self.notebook.GetPageCount()
+            if count > 0:
+                if not had_pages and active_entry is None:
+                    self.notebook.SetSelection(0)
+                self._update_window_title()
+            if pending and active_idx is not None:
+                self.show_transient_status(
+                    f"{len(pending)} saved conversation(s) will reopen when "
+                    "their folder is reachable again",
+                    revert_after_ms=10000,
+                )
+            elif not pending and active_idx is None and count > 0:
+                self.show_transient_status(
+                    "Saved conversations reopened", revert_after_ms=5000
+                )
+
+        submit_io(work, on_done)
 
     def _on_active_poll_timer(self, _event: wx.TimerEvent) -> None:
         """Fast poll: incremental read for the active tab at 500ms."""
@@ -4754,6 +4926,9 @@ class MainFrame(wx.Frame):
 
         self.backend_spec = spec
         self.backend = new_backend
+        self._pending_tabs = [
+            e for e in self._pending_tabs if e["provider"] == PROVIDER_CODEX
+        ]
         cfg = load_config()
         cfg["claude_dir"] = spec  # key kept for backwards compatibility
         save_config(cfg)
@@ -4895,6 +5070,9 @@ class MainFrame(wx.Frame):
                 pass
         self.codex_spec = spec
         self.codex_backend = new_backend
+        self._pending_tabs = [
+            e for e in self._pending_tabs if e["provider"] != PROVIDER_CODEX
+        ]
         cfg = load_config()
         cfg["codex_dir"] = spec
         save_config(cfg)
@@ -5056,42 +5234,28 @@ class App(wx.App):
         return True
 
     def _restore_tabs(self, frame: MainFrame, cfg: dict) -> None:
-        entries = cfg.get("open_tabs_v2")
-        if not isinstance(entries, list):
-            # Written by an older clacogui: Claude tabs only.
-            entries = [
-                {"provider": PROVIDER_CLAUDE, "rel": p}
-                for p in (cfg.get("open_tabs") or [])
-            ]
-        if not entries:
+        store = cfg.get("tabs_by_folder")
+        if isinstance(store, dict):
+            saved = store.get(frame.tab_store_key())
+            if not isinstance(saved, dict):
+                return
+            entries = saved.get("tabs")
+            active_idx = saved.get("active", 0)
+        else:
+            # Written by an older clacogui, which kept one list for all
+            # windows.
+            entries = cfg.get("open_tabs_v2")
+            if not isinstance(entries, list):
+                entries = [
+                    {"provider": PROVIDER_CLAUDE, "rel": p}
+                    for p in (cfg.get("open_tabs") or [])
+                ]
+            active_idx = cfg.get("active_tab_index", 0)
+        if not isinstance(entries, list) or not entries:
             return
-        active_idx = cfg.get("active_tab_index", 0)
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            provider = entry.get("provider") or PROVIDER_CLAUDE
-            rel_path = entry.get("rel")
-            backend = (
-                frame.codex_backend if provider == PROVIDER_CODEX else frame.backend
-            )
-            if backend is None or not isinstance(rel_path, str):
-                continue
-            try:
-                if not backend.exists(rel_path):
-                    log.debug("Skipping missing tab: %s", rel_path)
-                    continue
-                panel = ConversationPanel(
-                    frame.notebook, backend, rel_path, provider
-                )
-                frame.notebook.AddPage(
-                    panel, panel.conversation_name(), select=False
-                )
-            except Exception:
-                log.debug("Failed to restore tab %s", rel_path, exc_info=True)
-        if frame.notebook.GetPageCount() > 0:
-            idx = min(active_idx, frame.notebook.GetPageCount() - 1)
-            frame.notebook.SetSelection(max(0, idx))
-            frame._update_window_title()
+        if not isinstance(active_idx, int):
+            active_idx = 0
+        frame.restore_tabs(entries, active_idx)
 
     def _first_run_prompt(self, frame: MainFrame) -> None:
         new_spec = _ask_for_backend_spec(frame, None)
