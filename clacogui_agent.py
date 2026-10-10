@@ -1,15 +1,19 @@
-"""clacogui_agent - Claude Code hook bridge.
+"""clacogui_agent - Claude Code / Codex CLI hook bridge.
 
 Two subcommands:
 
-* ``hook``     -- invoked **on the Linux box** by Claude Code.  Reads the
-                  hook event JSON from stdin, then either writes a
-                  notification file (and exits immediately) or writes a
-                  permission-request file and waits for a response.
+* ``hook``     -- invoked **on the Linux box** by Claude Code (or by Codex
+                  with ``hook --codex``).  Reads the hook event JSON from
+                  stdin, then either writes a notification file (and exits
+                  immediately) or writes a permission-request file and
+                  waits for a response.
 
 * ``install``  -- runs **on Windows** (or anywhere with Python).  Configures
                   ``settings.json`` and the three working directories on a
                   local/SMB path or via FTP.  Idempotent; safe to re-run.
+                  ``install --codex`` does the same for a Codex home
+                  (``~/.codex``), writing a managed block into
+                  ``config.toml`` instead.
 
 Layout under ``<.claude>/``::
 
@@ -48,6 +52,13 @@ RESPONSES_DIR = "clacogui_responses"
 # own at install time.
 OUTGOING_DIR = "clacogui_outgoing"
 LAUNCHER_NAME = "clacogui_launcher.py"
+CODEX_LAUNCHER_NAME = "clacogui_codex_launcher.py"
+# Where clacogui_codex_launcher.py publishes each live TUI's thread + status.
+CODEX_STATE_DIR = "clacogui_sessions"
+
+# Set by ``hook --codex``: the hook then works under the Codex home and
+# emits Codex-shaped decisions.  ``None`` keeps the Claude behaviour.
+_HOME_OVERRIDE: Path | None = None
 
 # Permission requests block Claude until the user answers.  After this many
 # seconds we give up and deny by default so a forgotten window can't wedge a
@@ -60,7 +71,10 @@ DEFAULT_REQUEST_TIMEOUT_SEC = 300
 # ---------------------------------------------------------------------------
 
 
-def cmd_hook() -> None:
+def cmd_hook(codex: bool = False) -> None:
+    global _HOME_OVERRIDE
+    if codex:
+        _HOME_OVERRIDE = _codex_dir_from_env()
     raw = sys.stdin.read()
     try:
         event = json.loads(raw) if raw.strip() else {}
@@ -104,10 +118,16 @@ def cmd_hook() -> None:
 
 
 def _claude_dir_from_env() -> Path:
+    if _HOME_OVERRIDE is not None:
+        return _HOME_OVERRIDE
     return Path(
         os.environ.get("CLAUDE_CONFIG_DIR")
         or os.path.expanduser("~/.claude")
     )
+
+
+def _codex_dir_from_env() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
 
 
 # clacogui_agent.log lives next to the script so we can debug hook decisions
@@ -307,9 +327,32 @@ def _emit_permission_decision(resp: dict) -> None:
 
     Anything else (``"deny"``, missing, unparseable) falls through to a
     deny -- safer default for a hook with no clear answer.
+
+    Codex accepts the same shape but rejects unknown fields, and fails
+    closed on ``updatedInput`` / ``updatedPermissions`` (reserved there),
+    so under ``hook --codex`` only ``behavior`` and the deny ``message``
+    are sent.
     """
     decision = (resp.get("decision") or "").lower()
     reason = resp.get("reason") or ""
+
+    if _HOME_OVERRIDE is not None:
+        if decision == "allow":
+            decision_obj = {"behavior": "allow"}
+        else:
+            decision_obj = {
+                "behavior": "deny",
+                "message": reason or "Denied by clacogui user",
+            }
+        out = {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": decision_obj,
+            }
+        }
+        _hook_log(f"emit {decision_obj['behavior']} (codex)", out)
+        print(json.dumps(out))
+        sys.exit(0)
 
     if decision == "allow":
         decision_obj: dict = {"behavior": "allow"}
@@ -392,7 +435,19 @@ def cmd_install(argv: list[str]) -> None:
         action="store_true",
         help="Don't ask for confirmation, accept defaults for prompts.",
     )
+    p.add_argument(
+        "--codex",
+        action="store_true",
+        help=(
+            "Target is a Codex CLI home (~/.codex) instead of a Claude Code "
+            ".claude folder."
+        ),
+    )
     args = p.parse_args(argv)
+
+    if args.codex:
+        _cmd_install_codex(args)
+        return
 
     target = args.target or _ask(
         "Path or ftp:// URL to your Claude Code .claude folder",
@@ -704,6 +759,214 @@ def _merge_hook_config(settings: dict, cmd: str) -> dict:
     return settings
 
 
+# ---------------------------------------------------------------------------
+# install --codex
+# ---------------------------------------------------------------------------
+
+_CODEX_BLOCK_BEGIN = (
+    "# >>> clacogui hooks (managed by 'clacogui_agent install --codex'; "
+    "edits inside this block are overwritten) >>>"
+)
+_CODEX_BLOCK_END = "# <<< clacogui hooks <<<"
+
+# Codex has no ``Notification`` event; ``Stop`` / ``SubagentStop`` drive
+# the GUI's sounds and ``PermissionRequest`` its Allow/Deny dialog.
+_CODEX_HOOK_EVENTS: tuple[str, ...] = ("Stop", "SubagentStop", "PermissionRequest")
+
+# The hook waits DEFAULT_REQUEST_TIMEOUT_SEC for a click; Codex must not
+# kill it first.
+_CODEX_PERMISSION_TIMEOUT_SEC = DEFAULT_REQUEST_TIMEOUT_SEC + 30
+
+
+def _codex_hook_block(cmd: str) -> str:
+    lines = [_CODEX_BLOCK_BEGIN]
+    for event in _CODEX_HOOK_EVENTS:
+        lines += [
+            f"[[hooks.{event}]]",
+            'matcher = "*"',
+            "",
+            f"[[hooks.{event}.hooks]]",
+            'type = "command"',
+            f"command = {json.dumps(cmd)}",
+        ]
+        if event == "PermissionRequest":
+            lines.append(f"timeout = {_CODEX_PERMISSION_TIMEOUT_SEC}")
+        lines.append("")
+    lines.append(_CODEX_BLOCK_END)
+    return "\n".join(lines) + "\n"
+
+
+def _merge_codex_config(text: str, cmd: str) -> str:
+    """Replace (or append) the managed hook block in ``config.toml`` text.
+
+    Appending is safe because ``[[hooks.X]]`` headers reset the table
+    context, and it keeps the user's own hooks at their existing
+    positions -- Codex keys hook trust by position, so reordering them
+    would ask the user to re-review hooks they already trusted.
+    """
+    begin = text.find(_CODEX_BLOCK_BEGIN)
+    if begin >= 0:
+        end = text.find(_CODEX_BLOCK_END, begin)
+        if end < 0:
+            sys.exit(
+                "clacogui_agent: config.toml has the clacogui begin marker "
+                "but no end marker; fix it by hand and re-run."
+            )
+        end += len(_CODEX_BLOCK_END)
+        if text[end:end + 1] == "\n":
+            end += 1
+        head = text[:begin]
+        # Drop the blank separator line we put in front of the block.
+        if head.endswith("\n\n"):
+            head = head[:-1]
+        text = head + text[end:]
+    body = text.rstrip("\n")
+    merged = (body + "\n\n" if body.strip() else "") + _codex_hook_block(cmd)
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return merged
+    try:
+        tomllib.loads(merged)
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(
+            f"clacogui_agent: refusing to write config.toml, the result would "
+            f"not parse ({e}).  Your existing file was left unchanged."
+        )
+    return merged
+
+
+def _cmd_install_codex(args) -> None:
+    target = args.target or _ask(
+        "Path or ftp:// URL to your Codex home (.codex) folder",
+        default=None,
+        require=True,
+    )
+    here = Path(__file__).resolve().parent
+    agent_bytes = Path(__file__).resolve().read_bytes()
+    try:
+        launcher_bytes = (here / CODEX_LAUNCHER_NAME).read_bytes()
+    except OSError:
+        sys.exit(
+            f"clacogui_agent: {CODEX_LAUNCHER_NAME} not found next to "
+            f"clacogui_agent.py; install from a complete bundle."
+        )
+    is_ftp = target.lower().startswith(("ftp://", "ftps://"))
+    if is_ftp:
+        from urllib.parse import unquote, urlparse
+
+        root = unquote(urlparse(target).path or "/").rstrip("/") or "/"
+        default_remote = f"{root}/clacogui_agent.py"
+    else:
+        default_remote = "~/.codex/clacogui_agent.py"
+    remote_script = args.remote_script or _ask(
+        "Absolute path on the Linux box for the hook script",
+        default=default_remote,
+        require=True,
+        silent=args.yes,
+    )
+    interpreter = args.python or _ask(
+        "Python interpreter on the Linux box",
+        default="python3",
+        require=True,
+        silent=args.yes,
+    )
+    cmd = f"{interpreter} {remote_script} hook --codex"
+    dirs = (NOTIFICATIONS_DIR, REQUESTS_DIR, RESPONSES_DIR, OUTGOING_DIR, CODEX_STATE_DIR)
+    if is_ftp:
+        _install_codex_ftp(target, remote_script, agent_bytes, launcher_bytes, dirs, cmd)
+    else:
+        _install_codex_local(target, remote_script, agent_bytes, launcher_bytes, dirs, cmd)
+    print()
+    print("Done. The hook command Codex will run is:")
+    print(f"    {cmd}")
+    print(
+        "Codex asks you to review new hooks the next time its TUI starts; "
+        "choose 'Trust all and continue' so clacogui's hooks can run."
+    )
+
+
+def _install_codex_local(target, remote_script, agent_bytes, launcher_bytes, dirs, cmd) -> None:
+    codex_dir = Path(target).expanduser()
+    if not codex_dir.is_dir():
+        sys.exit(f"clacogui_agent: not a directory: {codex_dir}")
+    codex_dir = codex_dir.resolve()
+    print(f"[clacogui_agent] Local Codex install into {codex_dir}")
+    agent_target = codex_dir / Path(remote_script).name
+    agent_target.write_bytes(agent_bytes)
+    print(f"[clacogui_agent] Wrote {agent_target}")
+    launcher_target = codex_dir / CODEX_LAUNCHER_NAME
+    launcher_target.write_bytes(launcher_bytes)
+    print(f"[clacogui_agent] Wrote {launcher_target}")
+    for d in dirs:
+        (codex_dir / d).mkdir(exist_ok=True)
+        print(f"[clacogui_agent] Ensured {codex_dir / d}")
+    config_path = codex_dir / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    config_path.write_text(_merge_codex_config(text, cmd), encoding="utf-8")
+    print(f"[clacogui_agent] Updated {config_path}")
+
+
+def _install_codex_ftp(url, remote_script, agent_bytes, launcher_bytes, dirs, cmd) -> None:
+    import ftplib
+    import io
+    from urllib.parse import unquote, urlparse
+
+    u = urlparse(url)
+    if not u.hostname:
+        sys.exit(f"clacogui_agent: bad FTP URL: {url}")
+    root = unquote(u.path or "/").rstrip("/") or "/"
+    ftp = ftplib.FTP(timeout=30)
+    ftp.connect(u.hostname, u.port or 21)
+    ftp.login(
+        unquote(u.username) if u.username else "anonymous",
+        unquote(u.password) if u.password else "",
+    )
+    try:
+        ftp.sendcmd("OPTS UTF8 ON")
+    except ftplib.all_errors:
+        pass
+    ftp.set_pasv(True)
+    print(f"[clacogui_agent] FTP Codex install into {u.hostname}:{u.port or 21}{root}")
+    try:
+        remote_dir = remote_script.rsplit("/", 1)[0] or root
+        for remote, body in (
+            (remote_script, agent_bytes),
+            (f"{remote_dir}/{CODEX_LAUNCHER_NAME}", launcher_bytes),
+        ):
+            print(f"[clacogui_agent] Uploading {remote}")
+            ftp.storbinary(f"STOR {remote}", io.BytesIO(body))
+            try:
+                ftp.sendcmd(f"SITE CHMOD 755 {remote}")
+            except ftplib.all_errors:
+                pass
+        for d in dirs:
+            try:
+                ftp.mkd(f"{root}/{d}")
+                print(f"[clacogui_agent] Created {root}/{d}")
+            except ftplib.error_perm as e:
+                if not str(e).startswith("550"):
+                    raise
+        config_path = f"{root}/config.toml"
+        buf = io.BytesIO()
+        try:
+            ftp.retrbinary(f"RETR {config_path}", buf.write)
+        except ftplib.error_perm as e:
+            if not str(e).startswith("550"):
+                raise
+        merged = _merge_codex_config(buf.getvalue().decode("utf-8"), cmd)
+        ftp.storbinary(f"STOR {config_path}", io.BytesIO(merged.encode("utf-8")))
+        print(f"[clacogui_agent] Updated {config_path}")
+    finally:
+        try:
+            ftp.quit()
+        except ftplib.all_errors:
+            pass
+
+
 def _guess_remote_default(claude_dir: Path) -> str:
     """For SMB-mounted .claude dirs the local path is bogus on the server.
 
@@ -756,7 +1019,7 @@ def main() -> None:
 
     sub = sys.argv[1]
     if sub == "hook":
-        cmd_hook()
+        cmd_hook(codex="--codex" in sys.argv[2:])
     elif sub == "install":
         cmd_install(sys.argv[2:])
     elif sub in ("-h", "--help"):
@@ -773,9 +1036,13 @@ def _usage_and_exit(code: int = 2) -> None:
         "      Configure a Claude Code .claude directory (local path or\n"
         "      ftp:// URL) to use the clacogui hook.\n"
         "\n"
-        "  clacogui_agent hook\n"
+        "  clacogui_agent install --codex [target] [--remote-script PATH] "
+        "[--python BIN] [--yes]\n"
+        "      Same for a Codex CLI home (.codex); edits config.toml.\n"
+        "\n"
+        "  clacogui_agent hook [--codex]\n"
         "      Hook entry point.  Reads JSON from stdin; invoked by\n"
-        "      Claude Code on the Linux side.  Don't run by hand.\n"
+        "      Claude Code (or Codex) on the Linux side.  Don't run by hand.\n"
     )
     sys.exit(code)
 

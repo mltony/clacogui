@@ -300,6 +300,7 @@ from models import (
     parse_conversation,
     summarize_conversation,
 )
+import codex_models
 from render import (
     content_id as _render_content_id,
     render_blank_html,
@@ -316,6 +317,12 @@ CONFIG_PATH = os.path.join(
 
 POLL_INTERVAL_MS = 200
 ACTIVE_POLL_INTERVAL_MS = 200
+
+# Conversation sources.  Claude Code is the original (``claude_dir`` in
+# the config); a Codex CLI home is optional (``codex_dir``).  Each tab
+# remembers which one it came from.
+PROVIDER_CLAUDE = "claude"
+PROVIDER_CODEX = "codex"
 
 
 def _set_window_appid(hwnd: int) -> None:
@@ -683,7 +690,7 @@ class OpenConversationDialog(wx.Dialog):
         intro = wx.StaticText(
             panel,
             label=(
-                f"Conversations under: {self.backend.display_path('projects')}\n"
+                f"Conversations under: {self._index_root()}\n"
                 "Use Up/Down to choose, Enter to open. "
                 "Press Alt+T to sort by time, Alt+N to sort by name."
             ),
@@ -761,6 +768,9 @@ class OpenConversationDialog(wx.Dialog):
             return
         event.Skip()
 
+    def _index_root(self) -> str:
+        return self.backend.display_path("projects")
+
     # -- Data ---------------------------------------------------------------
 
     def _populate(self) -> None:
@@ -781,36 +791,7 @@ class OpenConversationDialog(wx.Dialog):
         cached_sids = self._active_sids
 
         def work() -> tuple[list[_Row], set[str]]:
-            session_names = load_session_names(backend)
-            rows: list[_Row] = []
-            for rel_path, project_dir, mtime, _size in iter_conversation_files(backend):
-                info = summarize_conversation(rel_path, session_names, project_dir, mtime)
-                rows.append(_Row(info))
-            # Reuse cached active_sids if available (from MainFrame's
-            # 1s poll), saving an FTP round-trip.
-            if cached_sids:
-                active_sids = cached_sids
-            else:
-                status_map, _ = _read_claude_session_state(backend)
-                active_sids = set(status_map.keys())
-            # Head-read for unnamed conversations: only those that are
-            # active (shown in the default view).  Inactive unnamed ones
-            # get their names lazily if the user checks "Show all".
-            unnamed = [
-                r for r in rows
-                if r.info.name == r.info.session_id
-                and r.info.session_id in active_sids
-            ]
-            unnamed.sort(key=lambda r: -r.info.mtime)
-            for r in unnamed[:20]:
-                try:
-                    head = backend.read_text_head(r.info.rel_path, 4096)
-                    name = extract_name_from_head(head)
-                    if name:
-                        r.info.name = name
-                except OSError:
-                    pass
-            return rows, active_sids
+            return self._scan(backend, cached_sids)
 
         submit_io_with_retry(
             self,
@@ -819,6 +800,41 @@ class OpenConversationDialog(wx.Dialog):
             self._on_populate_done,
             on_give_up=lambda _exc: self._on_populate_aborted(),
         )
+
+    def _scan(
+        self, backend: FsBackend, cached_sids: set[str]
+    ) -> tuple[list[_Row], set[str]]:
+        """Build the dialog rows.  Runs on the IO worker thread."""
+        session_names = load_session_names(backend)
+        rows: list[_Row] = []
+        for rel_path, project_dir, mtime, _size in iter_conversation_files(backend):
+            info = summarize_conversation(rel_path, session_names, project_dir, mtime)
+            rows.append(_Row(info))
+        # Reuse cached active_sids if available (from MainFrame's
+        # 1s poll), saving an FTP round-trip.
+        if cached_sids:
+            active_sids = cached_sids
+        else:
+            status_map, _ = _read_claude_session_state(backend)
+            active_sids = set(status_map.keys())
+        # Head-read for unnamed conversations: only those that are
+        # active (shown in the default view).  Inactive unnamed ones
+        # get their names lazily if the user checks "Show all".
+        unnamed = [
+            r for r in rows
+            if r.info.name == r.info.session_id
+            and r.info.session_id in active_sids
+        ]
+        unnamed.sort(key=lambda r: -r.info.mtime)
+        for r in unnamed[:20]:
+            try:
+                head = backend.read_text_head(r.info.rel_path, 4096)
+                name = extract_name_from_head(head)
+                if name:
+                    r.info.name = name
+            except OSError:
+                pass
+        return rows, active_sids
 
     def _on_populate_done(self, result: tuple[list[_Row], set[str]]) -> None:
         if not self:
@@ -942,6 +958,83 @@ class OpenConversationDialog(wx.Dialog):
         if idx < 0 or idx >= len(self._rows):
             return None
         return self._rows[idx].info
+
+
+class OpenCodexConversationDialog(OpenConversationDialog):
+    """Lists Codex rollouts under ``<codex_dir>/sessions``.
+
+    Only the newest day directories are walked until "Show all" is
+    ticked -- every directory listing is a round trip on FTP.
+    """
+
+    # Touched this recently counts as active even with no launcher
+    # attached, so a plain ``codex`` session still shows by default.
+    RECENT_ACTIVE_SEC = 3600
+
+    def __init__(
+        self,
+        parent: wx.Window,
+        backend: FsBackend,
+        cached_active_sids: Optional[set[str]] = None,
+    ) -> None:
+        self._day_limit: Optional[int] = codex_models.RECENT_DAY_DIRS
+        super().__init__(parent, backend, cached_active_sids)
+        self.SetTitle("Open Codex conversation")
+
+    def _index_root(self) -> str:
+        return self.backend.display_path(codex_models.SESSIONS_DIR)
+
+    def _scan(
+        self, backend: FsBackend, cached_sids: set[str]
+    ) -> tuple[list[_Row], set[str]]:
+        names = codex_models.load_session_names(backend)
+        states = codex_models.read_launcher_states(backend)
+        rows: list[_Row] = []
+        seen: set[str] = set()
+        for rel, _day, mtime, _size in codex_models.iter_conversation_files(
+            backend, self._day_limit
+        ):
+            rows.append(_Row(codex_models.summarize_conversation(rel, names, mtime)))
+            seen.add(rel)
+        # A launcher attached to an old thread lives outside the recent days.
+        for st in states.values():
+            if not st.rollout or st.rollout in seen:
+                continue
+            try:
+                mtime, _size = backend.stat(st.rollout)
+            except OSError:
+                continue
+            rows.append(_Row(codex_models.summarize_conversation(st.rollout, names, mtime)))
+            seen.add(st.rollout)
+        now = time.time()
+        active = set(states) | set(cached_sids or ())
+        active |= {
+            r.info.session_id
+            for r in rows
+            if r.info.session_id and r.info.mtime and now - r.info.mtime < self.RECENT_ACTIVE_SEC
+        }
+        shown = sorted(
+            (r for r in rows if r.info.session_id in active), key=lambda r: -r.info.mtime
+        )
+        for r in shown[:20]:
+            try:
+                r.info.project_dir = codex_models.cwd_from_head(
+                    backend.read_text_head(r.info.rel_path, 4096)
+                )
+            except OSError:
+                pass
+        return rows, active
+
+    def _apply_filter(self) -> None:
+        if self._chk_show_all.IsChecked() and self._day_limit is not None:
+            self._day_limit = None
+            self._populate()
+            return
+        super()._apply_filter()
+
+    def _resolve_unnamed_lazy(self) -> None:
+        # Codex names come from session_index.jsonl, read during the scan.
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1200,11 +1293,17 @@ class ConversationPanel(wx.Panel):
         parent: wx.Window,
         backend: FsBackend,
         rel_path: str,
+        provider: str = PROVIDER_CLAUDE,
     ) -> None:
         super().__init__(parent, name="ConversationPanel")
         self.backend = backend
         self.rel_path = rel_path
-        self._data: ConversationData = ConversationData()
+        self.provider = provider
+        self._data: ConversationData = (
+            codex_models.CodexConversationData()
+            if provider == PROVIDER_CODEX
+            else ConversationData()
+        )
         self._signature: Optional[tuple[float, int]] = None
         self._poll_failures = 0
         self._poll_quiet_count = 0
@@ -1286,6 +1385,24 @@ class ConversationPanel(wx.Panel):
     def display_path(self) -> str:
         return self.backend.display_path(self.rel_path)
 
+    @property
+    def is_codex(self) -> bool:
+        return self.provider == PROVIDER_CODEX
+
+    @property
+    def agent_label(self) -> str:
+        return "Codex" if self.is_codex else "Claude"
+
+    def codex_busy(self) -> bool:
+        """Whether the rollout shows a turn in progress (Codex tabs only)."""
+        return bool(getattr(self._data, "busy", False))
+
+    def _parse_fn(self) -> Callable[[FsBackend, str], ConversationData]:
+        """The transcript parser for this tab; captured on the UI thread."""
+        if self.is_codex:
+            return codex_models.parse_conversation
+        return parse_conversation
+
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
@@ -1345,7 +1462,7 @@ class ConversationPanel(wx.Panel):
         send_label = wx.StaticText(
             self._send_panel,
             label=(
-                "Send a &message to Claude "
+                f"Send a &message to {self.agent_label} "
                 "(Enter sends; Shift+Enter inserts a newline)"
             ),
         )
@@ -1359,7 +1476,7 @@ class ConversationPanel(wx.Panel):
         self._send_input = wx.TextCtrl(
             self._send_panel,
             style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER,
-            name="Send to Claude",
+            name=f"Send to {self.agent_label}",
         )
         # ~3 visible rows on most platforms.
         self._send_input.SetMinSize((-1, 70))
@@ -1375,7 +1492,9 @@ class ConversationPanel(wx.Panel):
             self._send_panel, label="&Interrupt"
         )
         self._interrupt_button.SetToolTip(
-            "Send Esc to claude to cancel its current turn (Ctrl+.)."
+            "Ask Codex to stop its current turn (Ctrl+.)."
+            if self.is_codex
+            else "Send Esc to claude to cancel its current turn (Ctrl+.)."
         )
         edit_row.Add(
             self._interrupt_button, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 4
@@ -1530,8 +1649,10 @@ class ConversationPanel(wx.Panel):
         if feedback:
             self._set_status(f"Refreshing {basename}...")
 
+        parse = self._parse_fn()
+
         def work():
-            return parse_conversation(backend, rel_path), file_signature(backend, rel_path)
+            return parse(backend, rel_path), file_signature(backend, rel_path)
 
         def on_success(result):
             if not self:
@@ -1627,6 +1748,7 @@ class ConversationPanel(wx.Panel):
         self._poll_gen += 1
         gen = self._poll_gen
         self._inflight_gen = gen
+        parse = self._parse_fn()
 
         def work():
             sig = file_signature(backend, rel_path)
@@ -1647,7 +1769,7 @@ class ConversationPanel(wx.Panel):
                 return (sig, None, tail_text)
             # Full re-read: first load, or the stored offset is somehow ahead
             # of the file, in which case reloading resets it to a real size.
-            data = parse_conversation(backend, rel_path)
+            data = parse(backend, rel_path)
             return (sig, data, None)
 
         def callback(result, exc):
@@ -1774,6 +1896,9 @@ class ConversationPanel(wx.Panel):
         would silently mis-account a tail whose base no longer matches (see
         the overlap guard in ``poll``).
         """
+        if self.is_codex:
+            self._apply_incremental_codex(tail_text, sig, base_offset)
+            return
         from models import _extract_user_text, _extract_assistant_text
 
         old_count = len(self._data.turns)
@@ -1896,6 +2021,45 @@ class ConversationPanel(wx.Panel):
             self.rel_path, len(tail_text), old_count, new_count,
         )
 
+    def _apply_incremental_codex(
+        self, tail_text: str, sig: tuple[float, int], base_offset: int
+    ) -> None:
+        """Codex counterpart of :meth:`_apply_incremental`.
+
+        Same byte accounting -- only complete lines are consumed, and the
+        stored offset advances by exactly the bytes consumed -- with the
+        line handling delegated to :mod:`codex_models`.
+        """
+        data = self._data
+        if not isinstance(data, codex_models.CodexConversationData):
+            # Nothing parsed yet; force the next poll to do a full read.
+            self._signature = None
+            return
+        old_count = len(data.turns)
+        old_selection = self.list_box.GetSelection()
+        last_nl = tail_text.rfind("\n")
+        if last_nl < 0:
+            self._signature = (sig[0], base_offset)
+            return
+        complete_text = tail_text[: last_nl + 1]
+        codex_models.consume_text(data, complete_text)
+        self._signature = (sig[0], base_offset + len(complete_text.encode("utf-8")))
+
+        new_count = len(data.turns)
+        if new_count != old_count:
+            self._refresh_list(preserve_selection=True)
+            if old_count > 0 and old_selection == old_count - 1:
+                self.list_box.SetSelection(new_count - 1)
+        self._refresh_html()
+
+        old_name = data.name
+        codex_models.refresh_name(data, self.rel_path)
+        if data.name != old_name:
+            self._notify_name_change()
+        log.info(
+            "Poll: %s codex incremental +%d bytes, turns %d->%d",
+            self.rel_path, len(tail_text), old_count, new_count,
+        )
 
     # -- WebView keystroke forwarding --------------------------------------
 
@@ -2935,6 +3099,8 @@ ID_FOCUS_LIST = wx.NewIdRef()
 ID_FOCUS_HTML = wx.NewIdRef()
 ID_FOCUS_SEND = wx.NewIdRef()
 ID_INTERRUPT_CLAUDE = wx.NewIdRef()
+ID_OPEN_CODEX = wx.NewIdRef()
+ID_CHANGE_CODEX_DIR = wx.NewIdRef()
 ID_TAB_1 = wx.NewIdRef()
 ID_TAB_2 = wx.NewIdRef()
 ID_TAB_3 = wx.NewIdRef()
@@ -2951,7 +3117,9 @@ _TAB_IDS = [ID_TAB_1, ID_TAB_2, ID_TAB_3, ID_TAB_4, ID_TAB_5,
 class MainFrame(wx.Frame):
     """Top-level window holding a notebook of open conversations."""
 
-    def __init__(self, backend_spec: Optional[str]) -> None:
+    def __init__(
+        self, backend_spec: Optional[str], codex_spec: Optional[str] = None
+    ) -> None:
         # The conversation name is prepended in ``_update_window_title``
         # whenever a tab is open; this is just the fallback "no
         # conversation" title.  Screen readers / the OS taskbar both
@@ -2973,6 +3141,16 @@ class MainFrame(wx.Frame):
             except Exception:
                 log.exception("Could not build backend from %r", backend_spec)
                 self.backend_spec = None
+        # Optional Codex CLI home (``codex_dir``).  Independent of the Claude
+        # folder: either, both or neither may be configured.
+        self.codex_spec: Optional[str] = codex_spec
+        self.codex_backend: Optional[FsBackend] = None
+        if codex_spec:
+            try:
+                self.codex_backend = make_backend(codex_spec)
+            except Exception:
+                log.exception("Could not build Codex backend from %r", codex_spec)
+                self.codex_spec = None
         self._build_menu()
         self._build_ui()
         self._build_accelerators()
@@ -3042,8 +3220,25 @@ class MainFrame(wx.Frame):
         # in the GUI for a session they had renamed.
         self._claude_session_names: dict[str, str] = {}
 
+        # Codex counterparts, filled by ``_poll_codex_agent``: live status
+        # from the Codex launcher's ``clacogui_sessions/*.json`` and thread
+        # names from ``session_index.jsonl`` (re-read only when it changes).
+        self._codex_status_map: dict[str, str] = {}
+        self._codex_session_names: dict[str, str] = {}
+        self._codex_index_sig: Optional[tuple[float, int]] = None
+        self._codex_agent_polling = False
+        self._codex_poll_started_at: Optional[float] = None
+        self._codex_poll_gen = 0
+        self._codex_inflight_gen = 0
+        self._codex_applied_gen = 0
+        # Which backend each permission request came from, so the response
+        # is written next to the hook that is waiting for it.
+        self._request_backends: dict[str, FsBackend] = {}
+
         self._update_status()
         self._gc_stale_agent_files()
+        if self.codex_backend is not None:
+            self._gc_stale_agent_files(self.codex_backend)
         self.Bind(wx.EVT_ACTIVATE, self._on_activate)
 
     # -- Construction -------------------------------------------------------
@@ -3052,11 +3247,13 @@ class MainFrame(wx.Frame):
         menubar = wx.MenuBar()
         file_menu = wx.Menu()
         file_menu.Append(ID_OPEN, "&Open conversation...\tCtrl+O")
+        file_menu.Append(ID_OPEN_CODEX, "Open Co&dex conversation...\tCtrl+Shift+O")
         file_menu.Append(ID_CLOSE_TAB, "&Close conversation\tCtrl+W")
         # F5 is the send-box jump now (see View menu); refresh keeps Ctrl+R.
         file_menu.Append(ID_RELOAD, "&Refresh current\tCtrl+R")
         file_menu.AppendSeparator()
         file_menu.Append(ID_CHANGE_DIR, "Change Claude Code &folder...")
+        file_menu.Append(ID_CHANGE_CODEX_DIR, "Change Codex fo&lder...")
         file_menu.AppendSeparator()
         file_menu.Append(wx.ID_EXIT, "E&xit\tAlt+F4")
         menubar.Append(file_menu, "&File")
@@ -3099,6 +3296,8 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._on_close_tab, id=ID_CLOSE_TAB)
         self.Bind(wx.EVT_MENU, self._on_reload, id=ID_RELOAD)
         self.Bind(wx.EVT_MENU, self._on_change_dir, id=ID_CHANGE_DIR)
+        self.Bind(wx.EVT_MENU, self._on_open_codex, id=ID_OPEN_CODEX)
+        self.Bind(wx.EVT_MENU, self._on_change_codex_dir, id=ID_CHANGE_CODEX_DIR)
         self.Bind(wx.EVT_MENU, lambda _e: self.Close(), id=wx.ID_EXIT)
         self.Bind(wx.EVT_MENU, lambda _e: self._switch_tab(+1), id=ID_NEXT_TAB)
         self.Bind(wx.EVT_MENU, lambda _e: self._switch_tab(-1), id=ID_PREV_TAB)
@@ -3150,6 +3349,7 @@ class MainFrame(wx.Frame):
     def _build_accelerators(self) -> None:
         accels = [
             (wx.ACCEL_CTRL, ord("O"), ID_OPEN),
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("O"), ID_OPEN_CODEX),
             (wx.ACCEL_CTRL, ord("W"), ID_CLOSE_TAB),
             (wx.ACCEL_CTRL, wx.WXK_F4, ID_CLOSE_TAB),
             (wx.ACCEL_CTRL, ord("R"), ID_RELOAD),
@@ -3315,11 +3515,16 @@ class MainFrame(wx.Frame):
     def _update_status(self) -> None:
         # Folder description goes into field 2 (rightmost).
         if self.backend is not None:
-            self.SetStatusText(f"Folder: {self.backend.display_root()}", 2)
+            folder = f"Folder: {self.backend.display_root()}"
         elif self.backend_spec:
-            self.SetStatusText(f"Folder (unavailable): {self.backend_spec}", 2)
+            folder = f"Folder (unavailable): {self.backend_spec}"
         else:
-            self.SetStatusText("No Claude Code folder set", 2)
+            folder = "No Claude Code folder set"
+        if self.codex_backend is not None:
+            folder += f" | Codex folder: {self.codex_backend.display_root()}"
+        elif self.codex_spec:
+            folder += f" | Codex folder (unavailable): {self.codex_spec}"
+        self.SetStatusText(folder, 2)
         # Field 0: claude status (idle/busy/...).  Field 1: send
         # status of the active tab (or empty when no tab is open).
         # Don't clobber a transient message that's still showing.
@@ -3358,6 +3563,15 @@ class MainFrame(wx.Frame):
         sid = self._claude_session_id_for_active_tab()
         if not sid:
             return ""
+        panel = self._current_panel()
+        if getattr(panel, "is_codex", False):
+            status = self._codex_status_map.get(sid)
+            if status:
+                return f"Codex: {status}"
+            # No launcher attached: sending can't work, but the rollout
+            # still tells us whether a turn is running.
+            state = "busy" if panel.codex_busy() else "idle"
+            return f"Codex: {state} (no launcher)"
         status = self._claude_status_map.get(sid)
         if not status:
             return "Claude: not running"
@@ -3394,9 +3608,12 @@ class MainFrame(wx.Frame):
             if not isinstance(page, ConversationPanel):
                 continue
             sid = page.claude_session_id()
-            alias = (
-                self._claude_session_names.get(sid) if sid else None
+            names = (
+                self._codex_session_names
+                if page.is_codex
+                else self._claude_session_names
             )
+            alias = names.get(sid) if sid else None
             try:
                 page.set_session_alias(alias)
             except Exception:
@@ -3555,13 +3772,22 @@ class MainFrame(wx.Frame):
         log.info("MainFrame closing")
         try:
             open_tabs = []
+            # Every tab with its source, in tab order.  ``open_tabs`` keeps
+            # listing the Claude ones on their own so an older clacogui can
+            # still restore them.
+            open_tabs_v2 = []
             for i in range(self.notebook.GetPageCount()):
                 page = self.notebook.GetPage(i)
                 if isinstance(page, ConversationPanel):
-                    open_tabs.append(page.rel_path)
+                    open_tabs_v2.append(
+                        {"provider": page.provider, "rel": page.rel_path}
+                    )
+                    if not page.is_codex:
+                        open_tabs.append(page.rel_path)
             active_idx = self.notebook.GetSelection()
             cfg = load_config()
             cfg["open_tabs"] = open_tabs
+            cfg["open_tabs_v2"] = open_tabs_v2
             cfg["active_tab_index"] = active_idx if active_idx != wx.NOT_FOUND else 0
             save_config(cfg)
         except Exception:
@@ -3570,11 +3796,12 @@ class MainFrame(wx.Frame):
             self._timer.Stop()
         except Exception:
             pass
-        if self.backend is not None:
-            try:
-                self.backend.close()
-            except Exception:
-                log.debug("Backend close raised", exc_info=True)
+        for backend in (self.backend, self.codex_backend):
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception:
+                    log.debug("Backend close raised", exc_info=True)
         self.Destroy()
 
     def _on_timer(self, _event: wx.TimerEvent) -> None:
@@ -3590,6 +3817,10 @@ class MainFrame(wx.Frame):
             self._poll_agent()
         except Exception:
             log.exception("Agent poll crashed")
+        try:
+            self._poll_codex_agent()
+        except Exception:
+            log.exception("Codex agent poll crashed")
 
     def _on_active_poll_timer(self, _event: wx.TimerEvent) -> None:
         """Fast poll: incremental read for the active tab at 500ms."""
@@ -3725,7 +3956,9 @@ class MainFrame(wx.Frame):
             # Turn-scoped hexec grants expire off this same status map, so
             # they must be reconciled before any request is answered from
             # one -- otherwise a grant could outlive its turn by one poll.
-            self._expire_hexec_grants(claude_status_map)
+            # Codex sessions are included so a Codex grant isn't seen as
+            # "session gone" by every Claude poll.
+            self._expire_hexec_grants(self._merged_status_map())
             self._refresh_claude_status_field()
             self._push_session_aliases()
             self._handle_new_notifications(notifications)
@@ -3734,16 +3967,104 @@ class MainFrame(wx.Frame):
 
         submit_io(work, callback)
 
-    def _handle_outgoing_snapshot(self, names: list[str]) -> None:
-        """Forward the ``clacogui_outgoing/`` listing to every panel.
+    def _poll_codex_agent(self) -> None:
+        """``_poll_agent`` for the Codex folder.
+
+        Same notification / request / outgoing directories (the agent and
+        the Codex launcher write them under the Codex home), plus the Codex
+        launcher's live status files and the thread-name index.  Runs with
+        the same watchdog + generation guard as the Claude poll.
+        """
+        backend = self.codex_backend
+        if backend is None:
+            return
+        if self._codex_agent_polling:
+            stuck_for = time.monotonic() - (self._codex_poll_started_at or 0.0)
+            if (
+                self._codex_poll_started_at is not None
+                and stuck_for > AGENT_POLL_WATCHDOG_SEC
+            ):
+                log.warning(
+                    "Forcing Codex agent-poll flag clear; stuck for %.1fs "
+                    "(superseding gen %d)",
+                    stuck_for, self._codex_inflight_gen,
+                )
+            else:
+                return
+        self._codex_agent_polling = True
+        self._codex_poll_started_at = time.monotonic()
+        self._codex_poll_gen += 1
+        gen = self._codex_poll_gen
+        self._codex_inflight_gen = gen
+        prev_index_sig = self._codex_index_sig
+
+        def work():
+            try:
+                outgoing_entries = backend.list_dir(AGENT_OUTGOING_DIR)
+            except FileNotFoundError:
+                outgoing_entries = []
+            except OSError:
+                log.debug("Codex list_dir(%s) failed", AGENT_OUTGOING_DIR, exc_info=True)
+                outgoing_entries = []
+            outgoing = sorted(e.name for e in outgoing_entries if not e.is_dir)
+            states = codex_models.read_launcher_states(backend)
+            index_sig = file_signature(backend, codex_models.SESSION_INDEX)
+            names = None
+            if index_sig is not None and index_sig != prev_index_sig:
+                names = codex_models.load_session_names(backend)
+            return (
+                _safe_list_basenames(backend, AGENT_NOTIFICATIONS_DIR),
+                _safe_list_basenames(backend, AGENT_REQUESTS_DIR),
+                outgoing,
+                {sid: st.status for sid, st in states.items()},
+                index_sig,
+                names,
+            )
+
+        def callback(result, exc):
+            if not self:
+                return
+            if gen == self._codex_inflight_gen:
+                self._codex_agent_polling = False
+                self._codex_poll_started_at = None
+            if gen <= self._codex_applied_gen:
+                return
+            self._codex_applied_gen = gen
+            if exc is not None:
+                log.warning("Codex agent poll IO failed: %s", exc)
+                return
+            if backend is not self.codex_backend:
+                # The Codex folder was changed while this poll ran.
+                return
+            notifications, requests, outgoing, status_map, index_sig, names = result
+            self._codex_status_map = status_map
+            if names is not None:
+                self._codex_session_names = names
+                self._codex_index_sig = index_sig
+            self._expire_hexec_grants(self._merged_status_map())
+            self._refresh_claude_status_field()
+            self._push_session_aliases()
+            self._handle_new_notifications(notifications, backend)
+            self._handle_new_requests(requests, backend)
+            self._handle_outgoing_snapshot(outgoing, backend)
+
+        submit_io(work, callback)
+
+    def _handle_outgoing_snapshot(
+        self, names: list[str], backend: Optional[FsBackend] = None
+    ) -> None:
+        """Forward a ``clacogui_outgoing/`` listing to that folder's panels.
 
         Each conversation panel maintains its own ``_pending_sends``
         dict and only acts on filenames it owns, so we don't have to
-        match panel <-> file here.
+        match panel <-> file here.  The listing must only reach panels of
+        the folder it came from, though: a panel treats "my file is not
+        in the listing" as *delivered*.
         """
+        source = backend if backend is not None else self.backend
         for i in range(self.notebook.GetPageCount()):
             page = self.notebook.GetPage(i)
-            if isinstance(page, ConversationPanel):
+            if isinstance(page, ConversationPanel) and page.backend is source:
                 try:
                     page.handle_outgoing_snapshot(names)
                 except Exception:
@@ -3751,8 +4072,11 @@ class MainFrame(wx.Frame):
                         "outgoing snapshot dispatch crashed for page %d", i
                     )
 
-    def _handle_new_notifications(self, names: list[str]) -> None:
-        backend = self.backend
+    def _handle_new_notifications(
+        self, names: list[str], backend: Optional[FsBackend] = None
+    ) -> None:
+        if backend is None:
+            backend = self.backend
         if backend is None:
             return
         new_names = [n for n in names if n not in self._seen_notifications]
@@ -3835,7 +4159,7 @@ class MainFrame(wx.Frame):
                     log.debug("could not read pending sends for page %d", i)
         return pending
 
-    def _gc_stale_agent_files(self) -> None:
+    def _gc_stale_agent_files(self, backend: Optional[FsBackend] = None) -> None:
         """Sweep agent protocol files that can no longer matter.
 
         A live agent process always cleans up its own request file (and the
@@ -3862,8 +4186,12 @@ class MainFrame(wx.Frame):
         Deleting one would therefore report a message as sent that never was,
         so pending ids are excluded outright and the rest wait out a longer
         cutoff.
+
+        ``backend`` defaults to the Claude folder; the Codex folder is swept
+        with the same rules.
         """
-        backend = self.backend
+        if backend is None:
+            backend = self.backend
         if backend is None:
             return
         now = time.time()
@@ -3937,8 +4265,11 @@ class MainFrame(wx.Frame):
 
         submit_io_write(work, callback)
 
-    def _handle_new_requests(self, names: list[str]) -> None:
-        backend = self.backend
+    def _handle_new_requests(
+        self, names: list[str], backend: Optional[FsBackend] = None
+    ) -> None:
+        if backend is None:
+            backend = self.backend
         if backend is None:
             return
         any_new = False
@@ -3960,7 +4291,7 @@ class MainFrame(wx.Frame):
             self._open_requests.add(name)
             any_new = True
             log.info("New permission request: %s", name)
-            self._fetch_request(name)
+            self._fetch_request(name, backend)
         if any_new:
             # Permission requests live in clacogui_requests/ (separate from
             # the notifications dir), so they don't pass through
@@ -3971,10 +4302,14 @@ class MainFrame(wx.Frame):
             # squelched (the user is already looking at the modal).
             self._last_completion_ts = time.time()
 
-    def _fetch_request(self, name: str) -> None:
-        backend = self.backend
+    def _fetch_request(
+        self, name: str, backend: Optional[FsBackend] = None
+    ) -> None:
+        if backend is None:
+            backend = self.backend
         if backend is None:
             return
+        self._request_backends[name] = backend
         rel = f"{AGENT_REQUESTS_DIR}/{name}"
 
         def work():
@@ -4092,6 +4427,14 @@ class MainFrame(wx.Frame):
                     "hexec grant expired: session=%s scope=%s uses=%d (%s)",
                     sid, grant.get("scope"), grant.get("uses"), reason,
                 )
+
+    def _merged_status_map(self) -> dict[str, str]:
+        """Claude and Codex live statuses keyed by session/thread id."""
+        if not self._codex_status_map:
+            return self._claude_status_map
+        merged = dict(self._codex_status_map)
+        merged.update(self._claude_status_map)
+        return merged
 
     def _clear_hexec_grants(self, why: str) -> None:
         if not self._hexec_grants:
@@ -4251,7 +4594,7 @@ class MainFrame(wx.Frame):
         ``_permission_dialog_active`` flag, so pumping the queue from its
         callback could open a second dialog alongside a live one.
         """
-        backend = self.backend
+        backend = self._request_backends.pop(name, None) or self.backend
         if backend is None:
             if advance_queue:
                 wx.CallAfter(self._process_next_permission)
@@ -4362,20 +4705,30 @@ class MainFrame(wx.Frame):
     def _set_backend(self, spec: str) -> None:
         """Replace the current backend with one built from ``spec``."""
         # Refuse to swap while conversations are open -- they hold a reference
-        # to the old backend.
-        if self.notebook.GetPageCount() > 0:
+        # to the old backend.  Codex tabs use their own folder and stay open.
+        claude_pages = [
+            i for i in range(self.notebook.GetPageCount())
+            if not getattr(self.notebook.GetPage(i), "is_codex", False)
+        ]
+        if claude_pages:
+            some_codex = len(claude_pages) < self.notebook.GetPageCount()
             choice = wx.MessageBox(
-                "Changing the folder will close all open conversations.\n\n"
-                "Continue?",
+                (
+                    "Changing the folder will close all open Claude "
+                    "conversations.\n\nContinue?"
+                    if some_codex
+                    else "Changing the folder will close all open "
+                    "conversations.\n\nContinue?"
+                ),
                 "Change folder",
                 wx.YES_NO | wx.ICON_QUESTION,
                 self,
             )
             if choice != wx.YES:
                 return
-            while self.notebook.GetPageCount() > 0:
-                page = self.notebook.GetPage(0)
-                self.notebook.RemovePage(0)
+            for i in reversed(claude_pages):
+                page = self.notebook.GetPage(i)
+                self.notebook.RemovePage(i)
                 try:
                     page.Destroy()
                 except Exception:
@@ -4443,24 +4796,26 @@ class MainFrame(wx.Frame):
 
         if info is None:
             return
+        self._open_tab(self.backend, info.rel_path, PROVIDER_CLAUDE)
 
+    def _open_tab(self, backend: FsBackend, rel_path: str, provider: str) -> None:
         # Don't open the same conversation twice; switch to existing tab.
         for i in range(self.notebook.GetPageCount()):
             page = self.notebook.GetPage(i)
             if (
                 isinstance(page, ConversationPanel)
-                and page.backend is self.backend
-                and page.rel_path == info.rel_path
+                and page.backend is backend
+                and page.rel_path == rel_path
             ):
                 self.notebook.SetSelection(i)
                 return
 
         try:
-            panel = ConversationPanel(self.notebook, self.backend, info.rel_path)
+            panel = ConversationPanel(self.notebook, backend, rel_path, provider)
         except Exception:
-            log.exception("Could not create ConversationPanel for %s", info.rel_path)
+            log.exception("Could not create ConversationPanel for %s", rel_path)
             wx.MessageBox(
-                f"Could not open conversation:\n{info.rel_path}",
+                f"Could not open conversation:\n{rel_path}",
                 "Error",
                 wx.OK | wx.ICON_ERROR,
                 self,
@@ -4471,6 +4826,84 @@ class MainFrame(wx.Frame):
         self._update_window_title()
         # Focus the message list so a screen reader starts reading there.
         panel.list_box.SetFocus()
+
+    def _on_open_codex(self, _event: wx.CommandEvent) -> None:
+        if self.codex_backend is None:
+            new_spec = _ask_for_backend_spec(self, self.codex_spec, kind=PROVIDER_CODEX)
+            if not new_spec:
+                return
+            self._set_codex_backend(new_spec)
+            if self.codex_backend is None:
+                return
+        dlg = OpenCodexConversationDialog(
+            self, self.codex_backend,
+            cached_active_sids=set(self._codex_status_map.keys()),
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            info = dlg.selected()
+        finally:
+            dlg.Destroy()
+        if info is None:
+            return
+        self._open_tab(self.codex_backend, info.rel_path, PROVIDER_CODEX)
+
+    def _on_change_codex_dir(self, _event: wx.CommandEvent) -> None:
+        new_spec = _ask_for_backend_spec(self, self.codex_spec, kind=PROVIDER_CODEX)
+        if new_spec:
+            self._set_codex_backend(new_spec)
+
+    def _set_codex_backend(self, spec: str) -> None:
+        """Replace the Codex folder; closes open Codex tabs (Claude tabs stay)."""
+        codex_pages = [
+            i for i in range(self.notebook.GetPageCount())
+            if getattr(self.notebook.GetPage(i), "is_codex", False)
+        ]
+        if codex_pages:
+            choice = wx.MessageBox(
+                "Changing the Codex folder will close all open Codex "
+                "conversations.\n\nContinue?",
+                "Change Codex folder",
+                wx.YES_NO | wx.ICON_QUESTION,
+                self,
+            )
+            if choice != wx.YES:
+                return
+        try:
+            new_backend = make_backend(spec)
+        except Exception as exc:
+            log.exception("Failed to build Codex backend from %r", spec)
+            wx.MessageBox(
+                f"Could not use {spec!r}:\n{exc}",
+                "Bad folder",
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+            return
+        for i in reversed(codex_pages):
+            page = self.notebook.GetPage(i)
+            self.notebook.RemovePage(i)
+            try:
+                page.Destroy()
+            except Exception:
+                pass
+        if self.codex_backend is not None:
+            try:
+                self.codex_backend.close()
+            except Exception:
+                pass
+        self.codex_spec = spec
+        self.codex_backend = new_backend
+        cfg = load_config()
+        cfg["codex_dir"] = spec
+        save_config(cfg)
+        self._codex_status_map = {}
+        self._codex_session_names = {}
+        self._codex_index_sig = None
+        self._update_window_title()
+        self._update_status()
+        self._gc_stale_agent_files(new_backend)
 
     def _on_close_tab(self, _event: wx.CommandEvent) -> None:
         idx = self.notebook.GetSelection()
@@ -4533,21 +4966,25 @@ class MainFrame(wx.Frame):
 
 
 def _ask_for_backend_spec(
-    parent: wx.Window, current: Optional[str]
+    parent: wx.Window, current: Optional[str], kind: str = PROVIDER_CLAUDE
 ) -> Optional[str]:
     """Prompt for either a local/SMB path or an FTP URL."""
+    if kind == PROVIDER_CODEX:
+        label, leaf = "Codex", ".codex"
+    else:
+        label, leaf = "Claude Code", ".claude"
     msg = (
-        "Enter the path to your Claude Code folder, or an FTP URL.\n\n"
+        f"Enter the path to your {label} folder, or an FTP URL.\n\n"
         "Examples:\n"
-        "  X:\\.claude\n"
-        "  \\\\server\\share\\.claude\n"
-        "  /home/me/.claude\n"
-        "  ftp://ftpuser:password@host:2121/home/me/.claude"
+        f"  X:\\{leaf}\n"
+        f"  \\\\server\\share\\{leaf}\n"
+        f"  /home/me/{leaf}\n"
+        f"  ftp://ftpuser:password@host:2121/home/me/{leaf}"
     )
     dlg = wx.TextEntryDialog(
         parent,
         msg,
-        "Choose Claude Code folder",
+        f"Choose {label} folder",
         value=current or "",
     )
     try:
@@ -4573,8 +5010,13 @@ class App(wx.App):
     A "spec" is either a local/SMB path or an ``ftp://`` URL.
     """
 
-    def __init__(self, backend_spec_arg: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        backend_spec_arg: Optional[str] = None,
+        codex_spec_arg: Optional[str] = None,
+    ) -> None:
         self._cli_spec = backend_spec_arg
+        self._codex_cli_spec = codex_spec_arg
         super().__init__(redirect=False)
 
     def OnInit(self) -> bool:
@@ -4588,13 +5030,24 @@ class App(wx.App):
         if spec and _looks_local(spec) and not os.path.isdir(spec):
             log.warning("Configured local folder %r does not exist", spec)
             spec = None
+        codex_spec = self._codex_cli_spec or cfg.get("codex_dir")
+        if codex_spec and _looks_local(codex_spec) and not os.path.isdir(codex_spec):
+            log.warning("Configured local Codex folder %r does not exist", codex_spec)
+            codex_spec = None
 
-        frame = MainFrame(spec)
+        frame = MainFrame(spec, codex_spec)
         frame.Show()
         self.SetTopWindow(frame)
 
+        if self._codex_cli_spec and frame.codex_backend is not None:
+            cfg["codex_dir"] = codex_spec
+            save_config(cfg)
         if frame.backend is None:
-            wx.CallAfter(self._first_run_prompt, frame)
+            if frame.codex_backend is None:
+                wx.CallAfter(self._first_run_prompt, frame)
+            else:
+                # Codex-only setup: don't nag for a Claude folder.
+                wx.CallAfter(self._restore_tabs, frame, cfg)
         elif spec:
             cfg["claude_dir"] = spec
             save_config(cfg)
@@ -4603,17 +5056,32 @@ class App(wx.App):
         return True
 
     def _restore_tabs(self, frame: MainFrame, cfg: dict) -> None:
-        open_tabs = cfg.get("open_tabs") or []
-        if not open_tabs or frame.backend is None:
+        entries = cfg.get("open_tabs_v2")
+        if not isinstance(entries, list):
+            # Written by an older clacogui: Claude tabs only.
+            entries = [
+                {"provider": PROVIDER_CLAUDE, "rel": p}
+                for p in (cfg.get("open_tabs") or [])
+            ]
+        if not entries:
             return
         active_idx = cfg.get("active_tab_index", 0)
-        for rel_path in open_tabs:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            provider = entry.get("provider") or PROVIDER_CLAUDE
+            rel_path = entry.get("rel")
+            backend = (
+                frame.codex_backend if provider == PROVIDER_CODEX else frame.backend
+            )
+            if backend is None or not isinstance(rel_path, str):
+                continue
             try:
-                if not frame.backend.exists(rel_path):
+                if not backend.exists(rel_path):
                     log.debug("Skipping missing tab: %s", rel_path)
                     continue
                 panel = ConversationPanel(
-                    frame.notebook, frame.backend, rel_path
+                    frame.notebook, backend, rel_path, provider
                 )
                 frame.notebook.AddPage(
                     panel, panel.conversation_name(), select=False

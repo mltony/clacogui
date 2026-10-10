@@ -1,17 +1,18 @@
 """clacogui - a wxPython GUI for browsing Claude Code conversations.
 
 Run with:
-    python clacogui.py [path-or-ftp-url]
+    python clacogui.py [path-or-ftp-url] [--codex path-or-ftp-url]
 
 Examples::
 
     python clacogui.py X:\\.claude
     python clacogui.py /home/me/.claude
     python clacogui.py ftp://ftpuser:<pw>@host:2121/home/me/.claude
+    python clacogui.py /home/me/.claude --codex /home/me/.codex
 
-Logs go to ``clacogui.log`` next to this script.  The chosen spec is
-remembered in ``~/.clacogui_config.json`` (under the ``claude_dir`` key for
-backwards compatibility).
+Logs go to ``clacogui.log`` next to this script.  The chosen specs are
+remembered in ``~/.clacogui_config.json`` (``claude_dir`` and
+``codex_dir``).
 """
 
 from __future__ import annotations
@@ -112,12 +113,23 @@ def _install_excepthooks() -> None:
     sys.stderr = _StreamToLogger(logging.getLogger("stderr"), logging.ERROR)
 
 
+def _parse_args(args: list[str]) -> tuple[str | None, str | None]:
+    """``[claude-spec] [--codex codex-spec]`` in either order."""
+    args = list(args)
+    codex_spec = None
+    if "--codex" in args:
+        i = args.index("--codex")
+        codex_spec = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    return (args[0] if args else None), codex_spec
+
+
 def main() -> None:
     _install_excepthooks()
     log.info("=" * 60)
     log.info("Starting clacogui; logging to %s", LOG_PATH)
 
-    cli_spec = sys.argv[1] if len(sys.argv) > 1 else None
+    cli_spec, codex_spec = _parse_args(sys.argv[1:])
 
     # Import wx-dependent modules AFTER logging is set up so any import errors
     # land in clacogui.log too.
@@ -128,7 +140,7 @@ def main() -> None:
         raise
 
     try:
-        app = App(backend_spec_arg=cli_spec)
+        app = App(backend_spec_arg=cli_spec, codex_spec_arg=codex_spec)
         app.MainLoop()
     except Exception:
         log.exception("Fatal error in main loop")

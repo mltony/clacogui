@@ -1,6 +1,8 @@
 # clacogui
 
-A small Windows GUI for browsing **Claude Code** conversation transcripts.
+A small Windows GUI for browsing **Claude Code** conversation transcripts,
+and optionally **Codex CLI** ones side by side (see
+[Codex CLI support](#codex-cli-support)).
 Built with `wxPython` + `wx.html2.WebView` so it works well with screen
 readers (NVDA, JAWS).
 
@@ -110,6 +112,7 @@ The log file is appended to on every run.
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+O` | Open conversation dialog |
+| `Ctrl+Shift+O` | Open Codex conversation dialog |
 | `Ctrl+W` (or `Ctrl+F4`) | Close current conversation tab |
 | `Ctrl+R` | Refresh current conversation from disk |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous conversation |
@@ -450,6 +453,77 @@ The launcher only consumes envelopes whose `session_id` matches the
 one it discovered in `<.claude>/sessions/<claude-pid>.json`, so
 multiple concurrent launchers (one per claude process) are safe.
 
+## Codex CLI support
+
+clacogui can show Codex CLI conversations next to Claude Code ones.
+The Codex home (`~/.codex`, or `$CODEX_HOME`) is a second, optional
+folder; it accepts the same forms as the Claude folder (local path,
+SMB-mapped drive, `ftp://` URL).
+
+### Pointing clacogui at it
+
+Any of:
+
+- **File -> Change Codex folder...** (remembered as `codex_dir` in
+  `%USERPROFILE%\.clacogui_config.json`);
+- `python clacogui.py <claude-spec> --codex <codex-spec>`;
+- with `run.cmd` and the WSL FTP setup, `setx CLACOGUI_WSL_CODEX_HOME
+  /home/me/.codex` and the Codex home is served by the same FTP server.
+
+Then **File -> Open Codex conversation...** (`Ctrl+Shift+O`).  The
+dialog walks the 14 newest day directories under `sessions/` (each
+listing is an FTP round trip); ticking **Show all** scans everything.
+"Active" there means attached to a Codex launcher or touched in the
+last hour.  Thread names come from Codex's `session_index.jsonl`.
+
+Changing the Claude folder no longer closes Codex tabs, and vice versa.
+
+### Hooks and launcher
+
+```bat
+install_agent.cmd --codex                                  REM prompts
+install_agent.cmd --codex X:\.codex
+install_agent.cmd --codex ftp://ftpuser:<pw>@host:2121/home/me/.codex
+```
+
+This copies `clacogui_agent.py` and `clacogui_codex_launcher.py` into
+the Codex home, creates the same working directories plus
+`clacogui_sessions/`, and appends a managed block to `config.toml`
+(`Stop`, `SubagentStop` and `PermissionRequest` hooks running
+`python3 .../clacogui_agent.py hook --codex`).  Re-running replaces the
+block in place; your own hooks are left where they are.  The next time
+Codex starts it asks you to **review the new hooks** -- pick *Trust all
+and continue*, otherwise they don't run.
+
+Run the launcher instead of `codex`; arguments pass straight through:
+
+```bash
+python3 ~/.codex/clacogui_codex_launcher.py                 # new thread
+python3 ~/.codex/clacogui_codex_launcher.py resume <id|name>
+```
+
+What changes compared to Claude:
+
+- **Status bar** field 0 reads `Codex: idle` / `Codex: busy` from the
+  launcher's `clacogui_sessions/<pid>.json`.  Without a launcher it
+  shows `Codex: idle (no launcher)` / `Codex: busy (no launcher)`,
+  taken from the rollout itself; sending needs the launcher.
+- **Send** uses `codex queue --thread <id> --message <text>`, so nothing
+  is typed into the TUI and a message sent while Codex is busy runs
+  right after the current turn.
+- **Interrupt** (`Ctrl+.`) sends one Esc, and only while a turn is
+  running: a second Esc at an idle Codex prompt opens "edit previous
+  message".
+- **Permission dialogs** come from Codex's `PermissionRequest` hook,
+  which fires when Codex itself would ask for approval (it depends on
+  your approval policy).  Codex sends no "always allow" suggestions.
+- The launcher learns its thread from Codex's
+  `tui-thread-reference-capabilities/` files, which the TUI touches when
+  it opens a thread; `/new` or `/resume` inside the TUI switches it.  A
+  *second* Codex TUI started without a launcher at the same moment can
+  be mistaken for it -- run every Codex you want to drive from clacogui
+  through a launcher.
+
 ## Files
 
 - `clacogui.py` &mdash; entry point, logging, `sys.excepthook`.
@@ -460,11 +534,15 @@ multiple concurrent launchers (one per claude process) are safe.
   `make_backend()`; read/write/list/delete/mkdir.
 - `models.py` &mdash; JSONL parsing, session-name lookup. All IO goes
   through an `FsBackend`.
+- `codex_models.py` &mdash; the same for Codex rollouts, thread names and
+  Codex launcher state.
 - `render.py` &mdash; Markdown -> HTML, code-block -> `<textarea>`
   rewriting, JS keystroke shim.
 - `clacogui_agent.py` &mdash; hook + installer; ships standalone.
 - `clacogui_launcher.py` &mdash; transparent PTY launcher for
   claude; installed by `clacogui_agent.py install`.
+- `clacogui_codex_launcher.py` &mdash; the Codex counterpart; installed by
+  `clacogui_agent.py install --codex`.
 - `install_agent.cmd` &mdash; convenience wrapper that runs
   `clacogui_agent.py install` under the venv.
 - `run.cmd` &mdash; Windows launcher: creates `.venv`, refreshes deps when

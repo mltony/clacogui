@@ -124,6 +124,13 @@ REM /home/me/.claude).
 if not defined CLACOGUI_WSL_HOME set "CLACOGUI_WSL_HOME=/home/%USERNAME%/.claude"
 set "DEFAULT_SPEC=ftp://ftpuser:%CLACOGUI_FTP_PASSWORD%@%WSL_IP%:2121%CLACOGUI_WSL_HOME%"
 echo [clacogui] Using FTP backend at %WSL_IP%:2121
+REM Optional Codex home over the same FTP server, e.g.
+REM     setx CLACOGUI_WSL_CODEX_HOME /home/me/.codex
+REM Without it, the Codex folder saved from the File menu (if any) is used.
+if defined CLACOGUI_WSL_CODEX_HOME (
+    "%VENV_PY%" clacogui.py "%DEFAULT_SPEC%" --codex "ftp://ftpuser:%CLACOGUI_FTP_PASSWORD%@%WSL_IP%:2121%CLACOGUI_WSL_CODEX_HOME%"
+    exit /b %errorlevel%
+)
 "%VENV_PY%" clacogui.py "%DEFAULT_SPEC%"
 exit /b %errorlevel%
 

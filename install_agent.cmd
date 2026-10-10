@@ -6,6 +6,7 @@ REM Examples:
 REM     install_agent.cmd
 REM     install_agent.cmd X:\.claude
 REM     install_agent.cmd ftp://ftpuser:^<pw^>@host:2121/home/me/.claude
+REM     install_agent.cmd --codex ftp://ftpuser:^<pw^>@host:2121/home/me/.codex
 REM ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
