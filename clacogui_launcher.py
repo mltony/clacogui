@@ -998,11 +998,19 @@ class Launcher:
                 continue
 
             if not sid:
-                # Nothing to match; treat as broadcast intended for a
-                # single-launcher setup and accept it.  This is the
-                # fallback for older GUIs that didn't tag.
-                pass
-            elif sid != self._session_id:
+                # Every launcher sees every envelope, so accepting an
+                # untagged one would deliver it to all sessions at once.
+                _log("rename to .failed: envelope has no session_id", {"id": env_id})
+                _rename_with_suffix(
+                    path,
+                    ".failed",
+                    {
+                        "error": "envelope has no session_id",
+                        "failed_at": int(time.time() * 1000),
+                    },
+                )
+                continue
+            if sid != self._session_id:
                 # Belongs to a different launcher (or our own
                 # session_id discovery is wrong) -- leave the file
                 # alone so a matching launcher can pick it up.  Log
