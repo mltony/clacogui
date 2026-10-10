@@ -264,8 +264,11 @@ AGENT_POLL_WATCHDOG_SEC = 30.0
 # exactly what the user reported as a bug.
 _COMPLETION_EVENTS: frozenset = frozenset({"Stop"})
 
-# Events that should be completely silent (no sound at all).
-_SILENT_EVENTS: frozenset = frozenset({"StopCompact"})
+# Events that should be completely silent (no sound at all).  ``SubagentStop``
+# must be listed here: anything not handled explicitly falls through to the
+# "unknown event, ring to be safe" branch, so a turn that runs subagents
+# would otherwise ping once per subagent.
+_SILENT_EVENTS: frozenset = frozenset({"StopCompact", "SubagentStop"})
 
 # If a "Notification" hook fires within this many seconds of the most
 # recent completion event, swallow it.  Claude Code emits a "Claude is
@@ -3230,8 +3233,8 @@ class MainFrame(wx.Frame):
         # memory only -- nothing is persisted, so a GUI restart clears them.
         # See the HEXEC_GRANT_* constants for the lifecycle.
         self._hexec_grants: dict[str, dict] = {}
-        # Track when we last rang for a "completion" event (Stop /
-        # SubagentStop / PreToolUse).  Claude Code fires a follow-up
+        # Track when we last rang for a "completion" event (Stop).
+        # Claude Code fires a follow-up
         # ``Notification`` ~60s after Stop ("waiting for your input"),
         # which sounds redundant -- suppress those if a completion was
         # recent.  See ``_handle_new_notifications``.
@@ -5467,7 +5470,7 @@ def _play_notification_sound(completion: bool = False) -> None:
     ``winsound.PlaySound`` with a WAV file works fine.
 
     ``completion=True`` is reserved for "Claude finished a turn"
-    (Stop / SubagentStop) and prefers the bundled
+    (Stop) and prefers the bundled
     ``wubbalubbadubdub.wav`` so the user can tell that case apart from
     "needs your attention" pings.  Permission requests, idle reminders,
     and unknown events keep the previous behavior.
