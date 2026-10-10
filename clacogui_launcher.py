@@ -158,11 +158,21 @@ _CTRL_C = b"\x03"
 # enough on Linux+xterm without feeling laggy to the user.
 _PRE_SUBMIT_PAUSE_SEC = 0.12
 
-# Pause after the erasure prefix (Ctrl+E + Ctrl+U + backspaces) and
-# before we start typing the new message.  Claude's prompt repaints
-# after deletions; we want it settled before the new bytes arrive so
-# they don't race the redraw.
+# Pause after each erasure write and before the next one.  Claude's
+# prompt repaints after deletions; we want it settled before the new
+# bytes arrive so they don't race the redraw.
 _POST_ERASE_PAUSE_SEC = 0.05
+
+# After each segment's fixed pause we keep draining claude's output
+# until it has been quiet this long (capped at ``_SETTLE_MAX_SEC``).
+# The pauses exist so each segment lands in its own input read, but a
+# pause spent not reading claude's output doesn't do that: once the PTY
+# buffer fills with claude's repaints, claude blocks in write(), stops
+# reading input, and the next segments pile up behind it -- body and CR
+# then arrive in one read and the CR is absorbed as a newline instead
+# of submitting.
+_SETTLE_QUIET_SEC = 0.10
+_SETTLE_MAX_SEC = 2.0
 
 # Erasure sequence we send before injecting a message when the user
 # has uncommitted text in claude's prompt.
@@ -883,9 +893,13 @@ class Launcher:
         Order, when ``with_erasure``:
           1. ``_ERASE_CYCLES`` repetitions of Ctrl+E (end of line) +
              Ctrl+U (kill line) + Backspace (join with the line above),
-             then N backspaces (clamped to
-             ``_MIN_ERASE_BACKSPACES``..``_MAX_ERASE_BACKSPACES``)
-             -- single write, followed by a small settle pause
+             followed by a small settle pause
+          1b. N backspaces (clamped to
+             ``_MIN_ERASE_BACKSPACES``..``_MAX_ERASE_BACKSPACES``) as a
+             separate write, followed by the same pause.  In one write
+             with the cycles, claude drops the cycles' effect and the
+             flood erases 8 characters fewer than it sends, so a long
+             prompt survives as residue in front of our message.
           2. The user's text, with CR/CRLF normalised to LF
              (``\\n``, Ctrl+J) -- claude's "insert newline"
              keystroke; followed by ``_PRE_SUBMIT_PAUSE_SEC``
@@ -907,17 +921,14 @@ class Launcher:
         """
         segments: list[tuple[bytes, float]] = []
         if with_erasure:
-            erase = bytearray()
-            for _ in range(_ERASE_CYCLES):
-                erase += _CTRL_E
-                erase += _CTRL_U
-                erase += _BACKSPACE
+            segments.append(
+                ((_CTRL_E + _CTRL_U + _BACKSPACE) * _ERASE_CYCLES, _POST_ERASE_PAUSE_SEC)
+            )
             n = min(
                 max(prior_buffer * 2 + 32, _MIN_ERASE_BACKSPACES),
                 _MAX_ERASE_BACKSPACES,
             )
-            erase += _BACKSPACE * n
-            segments.append((bytes(erase), _POST_ERASE_PAUSE_SEC))
+            segments.append((_BACKSPACE * n, _POST_ERASE_PAUSE_SEC))
         normalised = text.replace("\r\n", "\n").replace("\r", "\n")
         body = normalised.encode("utf-8", errors="replace")
         segments.append((body, _PRE_SUBMIT_PAUSE_SEC))
@@ -1250,7 +1261,7 @@ class Launcher:
                     break
                 total_bytes += len(chunk)
                 if pause > 0:
-                    time.sleep(pause)
+                    self._settle(pause)
 
             if write_failed is not None:
                 _log(
@@ -1289,6 +1300,41 @@ class Launcher:
                 pass
             except OSError as e:
                 _log("delete after deliver failed", {"path": path, "err": str(e)})
+
+    def _settle(self, pause: float) -> None:
+        """Wait out ``pause`` while forwarding claude's output, then
+        keep forwarding until it has been quiet for
+        ``_SETTLE_QUIET_SEC`` or ``_SETTLE_MAX_SEC`` has passed."""
+        start = time.monotonic()
+        last_output = start
+        while True:
+            now = time.monotonic()
+            if now - start >= _SETTLE_MAX_SEC:
+                return
+            if now - start >= pause and now - last_output >= _SETTLE_QUIET_SEC:
+                return
+            wait = max(
+                start + pause - now,
+                last_output + _SETTLE_QUIET_SEC - now,
+                0.0,
+            )
+            try:
+                rlist, _, _ = select.select([self._master_fd], [], [], wait)
+            except InterruptedError:
+                continue
+            if not rlist:
+                continue
+            try:
+                data = os.read(self._master_fd, 4096)
+            except OSError:
+                return
+            if not data:
+                return
+            last_output = time.monotonic()
+            try:
+                os.write(1, data)
+            except OSError as e:
+                _log("claude -> stdout write failed", {"err": str(e)})
 
     # -- main loop ----------------------------------------------------------
 
