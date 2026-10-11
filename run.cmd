@@ -47,7 +47,8 @@ REM ---------------------------------------------------------------------------
 
 set "REQ_HASH="
 
-for /f "tokens=*" %%H in ('"%VENV_PY%" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "%REQ_FILE%" 2^>nul') do set "REQ_HASH=%%H"
+REM CALL preserves the quoted executable path inside FOR /F's command shell.
+for /f "tokens=*" %%H in ('call "%VENV_PY%" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "%REQ_FILE%" 2^>nul') do set "REQ_HASH=%%H"
 
 if not defined REQ_HASH (
     echo [clacogui] WARNING: could not hash %REQ_FILE%; will reinstall to be safe.
