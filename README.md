@@ -19,7 +19,7 @@ readers (NVDA, JAWS).
 - a **local or SMB-mapped path**, e.g. `X:\.claude`, `\\server\share\.claude`,
   `/home/me/.claude`; or
 - an **FTP URL**, e.g.
-  `ftp://ftpuser:<password>@<wsl-hostname>:2121/home/me/.claude`.
+  `ftp://ftpuser:<password>@localhost:2121/home/me/.claude`.
 
 The FTP path is recommended when the Linux side runs Claude Code and you
 view from Windows, because Windows aggressively caches SMB metadata
@@ -49,10 +49,10 @@ Then double-click **`run.cmd`** (or run it from a shell):
 run.cmd
 ```
 
-By default `run.cmd` figures out the IP of your WSL distro
-(`wsl -- hostname -I`) and connects to the FTP backend at
+By default `run.cmd` connects to the FTP backend through WSL's localhost
+forwarding (WSL exposes its listening ports on Windows `localhost`), at
 
-    ftp://ftpuser:<CLACOGUI_FTP_PASSWORD>@<wsl-ip>:2121/home/<user>/.claude
+    ftp://ftpuser:<CLACOGUI_FTP_PASSWORD>@localhost:2121/home/<user>/.claude
 
 The matching pyftpdlib server, launched **inside WSL** with the same
 password, is:
