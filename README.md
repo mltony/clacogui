@@ -17,6 +17,10 @@ readers (NVDA, JAWS).
   `%LOCALAPPDATA%\clacogui\transcripts`, so reopening a tab (e.g. at
   startup) downloads only what was appended since.  Copies unused for 30
   days are deleted at startup; the folder is safe to delete at any time.
+- Several clacogui windows can run side by side, but each Claude or Codex
+  folder can only be open in one of them.  A window started on a folder
+  another window has open leaves it closed (and exits if that was its only
+  folder); *Change folder* refuses such a folder.
 
 `<root>` can be either:
 

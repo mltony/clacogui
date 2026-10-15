@@ -15,6 +15,7 @@ shortcuts.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ import uuid
 import webbrowser
 from dataclasses import dataclass
 from typing import Callable, Optional
+from urllib.parse import unquote, urlparse
 
 import wx
 import wx.html2
@@ -3291,6 +3293,17 @@ class MainFrame(wx.Frame):
         )
         if sys.platform == "win32":
             _set_window_appid(self.GetHandle())
+        # Folders configured for this window that another clacogui already
+        # has open; they are left closed (see ``_lock_folder``).
+        self.busy_folders: list[str] = []
+        self._folder_locks: dict[str, tuple[str, wx.SingleInstanceChecker]] = {}
+        if backend_spec:
+            lock = self._lock_folder(PROVIDER_CLAUDE, backend_spec)
+            if lock is None:
+                self.busy_folders.append(backend_spec)
+                backend_spec = None
+            else:
+                self._folder_locks[PROVIDER_CLAUDE] = lock
         self.backend_spec: Optional[str] = backend_spec
         self.backend: Optional[FsBackend] = None
         if backend_spec:
@@ -3301,6 +3314,13 @@ class MainFrame(wx.Frame):
                 self.backend_spec = None
         # Optional Codex CLI home (``codex_dir``).  Independent of the Claude
         # folder: either, both or neither may be configured.
+        if codex_spec:
+            lock = self._lock_folder(PROVIDER_CODEX, codex_spec)
+            if lock is None:
+                self.busy_folders.append(codex_spec)
+                codex_spec = None
+            else:
+                self._folder_locks[PROVIDER_CODEX] = lock
         self.codex_spec: Optional[str] = codex_spec
         self.codex_backend: Optional[FsBackend] = None
         if codex_spec:
@@ -5059,8 +5079,41 @@ class MainFrame(wx.Frame):
         if new_spec:
             self._set_backend(new_spec)
 
+    def _lock_folder(
+        self, provider: str, spec: str
+    ) -> Optional[tuple[str, wx.SingleInstanceChecker]]:
+        """The system-wide lock on ``spec``, or ``None`` if another clacogui holds it.
+
+        Two windows on one folder would both append to the same local
+        transcript copies (see :mod:`transcript_cache`), so only one may
+        have it open.  The lock is held for as long as the returned checker
+        lives: store it in ``_folder_locks`` once the folder is in use, which
+        also releases the folder it replaces.
+        """
+        key = _lock_key(spec)
+        held = self._folder_locks.get(provider)
+        if held is not None and held[0] == key:
+            return held
+        checker = wx.SingleInstanceChecker(_folder_lock_name(provider, key))
+        if checker.IsAnotherRunning():
+            log.warning("%s folder %s is already open in another clacogui", provider, key)
+            return None
+        return key, checker
+
+    def _refuse_busy_folder(self, spec: str) -> None:
+        wx.MessageBox(
+            f"{_redact_spec(spec)}\n\nis already open in another clacogui window.",
+            "Folder already open",
+            wx.OK | wx.ICON_INFORMATION,
+            self,
+        )
+
     def _set_backend(self, spec: str) -> None:
         """Replace the current backend with one built from ``spec``."""
+        lock = self._lock_folder(PROVIDER_CLAUDE, spec)
+        if lock is None:
+            self._refuse_busy_folder(spec)
+            return
         # Refuse to swap while conversations are open -- they hold a reference
         # to the old backend.  Codex tabs use their own folder and stay open.
         claude_pages = [
@@ -5111,6 +5164,7 @@ class MainFrame(wx.Frame):
 
         self.backend_spec = spec
         self.backend = new_backend
+        self._folder_locks[PROVIDER_CLAUDE] = lock
         self._pending_tabs = [
             e for e in self._pending_tabs if e["provider"] == PROVIDER_CODEX
         ]
@@ -5216,6 +5270,10 @@ class MainFrame(wx.Frame):
 
     def _set_codex_backend(self, spec: str) -> None:
         """Replace the Codex folder; closes open Codex tabs (Claude tabs stay)."""
+        lock = self._lock_folder(PROVIDER_CODEX, spec)
+        if lock is None:
+            self._refuse_busy_folder(spec)
+            return
         codex_pages = [
             i for i in range(self.notebook.GetPageCount())
             if getattr(self.notebook.GetPage(i), "is_codex", False)
@@ -5255,6 +5313,7 @@ class MainFrame(wx.Frame):
                 pass
         self.codex_spec = spec
         self.codex_backend = new_backend
+        self._folder_locks[PROVIDER_CODEX] = lock
         self._pending_tabs = [
             e for e in self._pending_tabs if e["provider"] != PROVIDER_CODEX
         ]
@@ -5402,6 +5461,23 @@ class App(wx.App):
             codex_spec = None
 
         frame = MainFrame(spec, codex_spec)
+        if frame.busy_folders:
+            names = "\n".join(_redact_spec(s) for s in frame.busy_folders)
+            if frame.backend is None and frame.codex_backend is None:
+                wx.MessageBox(
+                    f"Already open in another clacogui window:\n\n{names}",
+                    "clacogui",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                frame.Destroy()
+                return False
+            wx.CallAfter(
+                wx.MessageBox,
+                f"Not opened here, because another clacogui window has it open:\n\n{names}",
+                "Folder already open",
+                wx.OK | wx.ICON_INFORMATION,
+                frame,
+            )
         frame.Show()
         self.SetTopWindow(frame)
 
@@ -5458,6 +5534,31 @@ class App(wx.App):
 def _looks_local(spec: str) -> bool:
     lower = spec.strip().lower()
     return not (lower.startswith("ftp://") or lower.startswith("ftps://"))
+
+
+def _lock_key(spec: str) -> str:
+    """``spec`` without credentials, normalized so equal folders compare equal.
+
+    Unlike :func:`folder_key` this keeps the FTP host: the same path on two
+    machines is two folders.
+    """
+    spec = spec.strip()
+    if _looks_local(spec):
+        return os.path.normcase(os.path.abspath(spec)).rstrip("\\/")
+    u = urlparse(spec)
+    host = u.netloc.rsplit("@", 1)[-1].lower()
+    if ":" not in host:
+        host += ":21"
+    return f"ftp://{host}{unquote(u.path or '/').rstrip('/')}"
+
+
+def _folder_lock_name(provider: str, key: str) -> str:
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return f"clacogui-{provider}-{digest}"
+
+
+def _redact_spec(spec: str) -> str:
+    return spec if _looks_local(spec) else _lock_key(spec)
 
 
 # ---------------------------------------------------------------------------
