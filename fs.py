@@ -55,6 +55,10 @@ class FsBackend:
     root.  An empty string or ``"/"`` refers to the root itself.
     """
 
+    # Whether transcripts read through this backend are worth keeping a
+    # local copy of (see :mod:`transcript_cache`).
+    cache_transcripts = False
+
     def list_dir(self, rel: str) -> list[FsEntry]:
         raise NotImplementedError
 
@@ -70,9 +74,11 @@ class FsBackend:
 
     def read_text_from(self, rel: str, offset: int, encoding: str = "utf-8") -> str:
         """Read from byte ``offset`` to end of file."""
-        text = self.read_text(rel, encoding)
-        # Default: read all then slice (subclasses override for efficiency).
-        return text[offset:] if offset > 0 else text
+        return self.read_bytes_from(rel, offset).decode(encoding, errors="replace")
+
+    def read_bytes_from(self, rel: str, offset: int) -> bytes:
+        """Raw bytes from byte ``offset`` to end of file."""
+        raise NotImplementedError
 
     def stat(self, rel: str) -> tuple[float, int]:
         """Return ``(mtime, size)`` or raise :class:`OSError`."""
@@ -197,12 +203,11 @@ class LocalBackend(FsBackend):
             raw = f.read(max_bytes)
         return raw.decode(encoding, errors="replace")
 
-    def read_text_from(self, rel: str, offset: int, encoding: str = "utf-8") -> str:
+    def read_bytes_from(self, rel: str, offset: int) -> bytes:
         with open(self._full(rel), "rb") as f:
             if offset > 0:
                 f.seek(offset)
-            raw = f.read()
-        return raw.decode(encoding, errors="replace")
+            return f.read()
 
     def stat(self, rel: str) -> tuple[float, int]:
         st = os.stat(self._full(rel))
@@ -274,6 +279,8 @@ class FtpBackend(FsBackend):
     and the next call from that same thread reconnects.  Other
     threads' connections are unaffected.
     """
+
+    cache_transcripts = True
 
     def __init__(
         self,
@@ -569,10 +576,10 @@ class FtpBackend(FsBackend):
 
         return self._retry(work)
 
-    def read_text_from(self, rel: str, offset: int, encoding: str = "utf-8") -> str:
+    def read_bytes_from(self, rel: str, offset: int) -> bytes:
         full = self._full(rel)
 
-        def work() -> str:
+        def work() -> bytes:
             ftp = self._conn()
             self._force_type_i(ftp)
             # Use REST to resume from offset, avoiding full file download.
@@ -587,7 +594,7 @@ class FtpBackend(FsBackend):
                 ftp.voidresp()
             except ftplib.all_errors:
                 pass
-            return bytes(buf).decode(encoding, errors="replace")
+            return bytes(buf)
 
         return self._retry(work)
 

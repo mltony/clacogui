@@ -36,6 +36,7 @@ except ImportError:  # not on Windows; we'll fall back to wx.Bell
     winsound = None  # type: ignore[assignment]
 
 import models
+import transcript_cache
 import webview_health
 from fs import FsBackend, FtpBackend, make_backend
 
@@ -1920,7 +1921,7 @@ class ConversationPanel(wx.Panel):
             # Incremental: if file grew (append-only) and we have prior data,
             # read only the tail.
             if prev_size > 0 and new_size > prev_size:
-                tail_text = backend.read_text_from(rel_path, prev_size)
+                tail_text = transcript_cache.read_text_from(backend, rel_path, prev_size)
                 return (sig, None, tail_text)
             # Full re-read: first load, or the stored offset is somehow ahead
             # of the file, in which case reloading resets it to a real size.
@@ -5383,6 +5384,9 @@ class App(wx.App):
 
     def OnInit(self) -> bool:
         log.info("clacogui starting (wxPython %s)", wx.version())
+        threading.Thread(
+            target=transcript_cache.prune, name="clacogui-cache-prune", daemon=True
+        ).start()
         self.SetAppName("clacogui")
         self.SetAppDisplayName("clacogui")
         self.SetClassName("clacogui")

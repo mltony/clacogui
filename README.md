@@ -13,6 +13,10 @@ readers (NVDA, JAWS).
 - Reads matching session names from `<root>/sessions/*.json`.
 - Lets you keep multiple conversations open as tabs.
 - Polls every second so new messages and renamed sessions show up live.
+- Over FTP, keeps a local copy of each opened transcript in
+  `%LOCALAPPDATA%\clacogui\transcripts`, so reopening a tab (e.g. at
+  startup) downloads only what was appended since.  Copies unused for 30
+  days are deleted at startup; the folder is safe to delete at any time.
 
 `<root>` can be either:
 

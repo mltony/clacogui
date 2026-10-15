@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
+import transcript_cache
 from fs import FsBackend
 from models import ConversationData, ConversationInfo, Turn
 
@@ -193,7 +194,7 @@ def refresh_name(data: CodexConversationData, rel_path: str) -> None:
 
 def parse_conversation(backend: FsBackend, rel_path: str) -> CodexConversationData:
     """Parse a Codex rollout.  Raises :class:`OSError` on read failure."""
-    text = backend.read_text(rel_path)
+    text = transcript_cache.read_text(backend, rel_path)
     data = CodexConversationData()
     consume_text(data, text)
     if data.session_id is None:

@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
+import transcript_cache
 from fs import FsBackend
 
 log = logging.getLogger(__name__)
@@ -258,7 +259,7 @@ def parse_conversation(backend: FsBackend, rel_path: str) -> ConversationData:
     skipped so a partial write at the tail of an actively-being-written
     file doesn't break the whole conversation.
     """
-    text = backend.read_text(rel_path)
+    text = transcript_cache.read_text(backend, rel_path)
 
     data = ConversationData()
     pending: Optional[Turn] = None
