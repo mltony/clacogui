@@ -18,6 +18,7 @@ remembered in ``~/.clacogui_config.json`` (``claude_dir`` and
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import sys
 import traceback
@@ -32,6 +33,9 @@ if sys.platform == "win32":
 
 LOG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "clacogui.log"
+)
+WEBVIEW_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "clacogui-webview.log"
 )
 
 
@@ -50,6 +54,14 @@ def _configure_logging() -> logging.Logger:
         )
     )
     root.addHandler(file_handler)
+
+    # WebView health (gui.wvlog) also goes to its own small file, which is
+    # easy to copy off even when clacogui.log has grown huge.
+    webview_handler = logging.handlers.RotatingFileHandler(
+        WEBVIEW_LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    webview_handler.setFormatter(file_handler.formatter)
+    logging.getLogger("webview").addHandler(webview_handler)
 
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setLevel(logging.WARNING)

@@ -36,6 +36,7 @@ except ImportError:  # not on Windows; we'll fall back to wx.Bell
     winsound = None  # type: ignore[assignment]
 
 import models
+import webview_health
 from fs import FsBackend, FtpBackend, make_backend
 
 # Directory names mirrored from clacogui_agent.py.  Kept inline (rather than
@@ -312,6 +313,9 @@ from render import (
 )
 
 log = logging.getLogger(__name__)
+# Separate logger so WebView health also lands in its own small file
+# (clacogui-webview.log, see clacogui.py).
+wvlog = logging.getLogger("webview")
 
 
 CONFIG_PATH = os.path.join(
@@ -319,6 +323,8 @@ CONFIG_PATH = os.path.join(
 )
 
 POLL_INTERVAL_MS = 200
+WEBVIEW_CHECK_SEC = 30
+WEBVIEW_REBUILD_MIN_SEC = 120
 PENDING_TAB_RETRY_SEC = 15.0
 ACTIVE_POLL_INTERVAL_MS = 200
 
@@ -1372,6 +1378,13 @@ class ConversationPanel(wx.Panel):
         # would otherwise force the screen reader back to the top.
         self._last_doc_url: Optional[str] = None
         self._last_inner_html: Optional[str] = None
+        # WebView health (see ``probe_webview``): only a view that was once
+        # seen with its Chrome child windows counts as broken when they go.
+        self._wv_seen_healthy = False
+        self._wv_last_shape: Optional[tuple] = None
+        self._wv_last_js: Optional[str] = None
+        self._wv_last_report = 0.0
+        self._wv_rebuilt_at = 0.0
         # Outgoing-message state: id -> tracking dict.  See
         # ``_on_send`` for the dict shape and the state machine in
         # ``handle_outgoing_snapshot``.
@@ -1583,6 +1596,9 @@ class ConversationPanel(wx.Panel):
         for ctrl in (self.list_box, self._right_panel, self._left_panel):
             ctrl.Bind(wx.EVT_KEY_DOWN, self._on_keydown)
 
+        self._bind_webview()
+
+    def _bind_webview(self) -> None:
         # The WebView's native control swallows keyboard input before wx can
         # turn it into accelerators.  We work around this with the JS in
         # render._KEY_FORWARDER_JS, which navigates to ``clacogui-action://x``;
@@ -1590,6 +1606,106 @@ class ConversationPanel(wx.Panel):
         self.webview.Bind(
             wx.html2.EVT_WEBVIEW_NAVIGATING, self._on_webview_navigating
         )
+        self.webview.Bind(wx.html2.EVT_WEBVIEW_ERROR, self._on_webview_error)
+        self.webview.Bind(wx.EVT_SET_FOCUS, self._on_webview_focus)
+        self.webview.Bind(wx.EVT_KILL_FOCUS, self._on_webview_focus)
+
+    # -- WebView health -----------------------------------------------------
+
+    def _wv_name(self) -> str:
+        return os.path.basename(self.rel_path)
+
+    def _on_webview_error(self, event) -> None:
+        wvlog.warning(
+            "[%s] WebView error %s at %s: %s",
+            self._wv_name(), event.GetInt(), event.GetURL(), event.GetString(),
+        )
+        event.Skip()
+
+    def _on_webview_focus(self, event: wx.FocusEvent) -> None:
+        # Must Skip: wx's own SetFocus handler is what moves focus into
+        # the Edge control.
+        event.Skip()
+        gained = event.GetEventType() == wx.wxEVT_SET_FOCUS
+        name = self._wv_name()
+        wvlog.info("[%s] WebView host %s focus", name, "got" if gained else "lost")
+        if gained:
+            wx.CallLater(400, lambda: wvlog.info(
+                "[%s] 400ms later the focus is on %s", name, webview_health.focused_window()))
+
+    def probe_webview(self, run_js: bool) -> webview_health.NativeState:
+        """Log the WebView's native state when it changes (and every 10 min).
+
+        ``run_js`` also pings the page; skipped when the Chrome windows are
+        already gone, since there is nothing left to answer.
+        """
+        state = webview_health.native_state(self.webview.GetHandle())
+        js = None
+        if run_js and state.chrome_windows:
+            js = self._ping_page()
+        now = time.monotonic()
+        changed = state.shape() != self._wv_last_shape or (js is not None and js != self._wv_last_js)
+        if changed or now - self._wv_last_report >= 600:
+            level = logging.WARNING if self._wv_seen_healthy and not state.healthy else logging.INFO
+            wvlog.log(level, "[%s] %s; page: %s", self._wv_name(), state.summary(),
+                      js if js is not None else "not checked")
+            self._wv_last_report = now
+        self._wv_last_shape = state.shape()
+        if js is not None:
+            self._wv_last_js = js
+        if state.healthy:
+            self._wv_seen_healthy = True
+        return state
+
+    def webview_broken(self, state: webview_health.NativeState) -> bool:
+        return self._wv_seen_healthy and not state.healthy
+
+    def _ping_page(self) -> str:
+        script = (
+            "document.readyState + ' ' + document.getElementsByTagName('*').length + ' elements, active '"
+            " + (document.activeElement ? document.activeElement.tagName : 'none')"
+        )
+        started = time.monotonic()
+        try:
+            result = self.webview.RunScript(script)
+        except Exception as e:
+            return f"RunScript raised {e!r}"
+        took = (time.monotonic() - started) * 1000
+        if isinstance(result, tuple):
+            ok, out = (result + (None,))[:2]
+        else:
+            ok, out = bool(result), None
+        slow = f" (took {took:.0f}ms)" if took >= 1000 else ""
+        return f"{out}{slow}" if ok else f"RunScript failed{slow}"
+
+    def recreate_webview(self, reason: str) -> None:
+        """Replace the WebView with a fresh one and re-render the current turn."""
+        old = self.webview
+        had_focus = self._is_inside_webview(self._focus_holder_safely())
+        wvlog.warning("[%s] Rebuilding the content view (%s); old one: %s", self._wv_name(), reason,
+                      webview_health.native_state(old.GetHandle()).summary())
+        new = _make_webview(self._right_panel)
+        self._right_panel.GetSizer().Replace(old, new)
+        self.webview = new
+        self._bind_webview()
+        try:
+            old.Destroy()
+        except Exception:
+            wvlog.exception("[%s] Destroying the old WebView failed", self._wv_name())
+        self._right_panel.Layout()
+        self._last_doc_url = None
+        self._last_inner_html = None
+        self._wv_seen_healthy = False
+        self._wv_last_shape = None
+        self._wv_last_js = None
+        self._wv_rebuilt_at = time.monotonic()
+        self._refresh_html()
+        if had_focus:
+            wx.CallLater(800, self._focus_new_webview, new)
+
+    def _focus_new_webview(self, view: "wx.html2.WebView") -> None:
+        if view is self.webview:
+            view.SetFocus()
 
     def _on_keydown(self, event: wx.KeyEvent) -> None:
         if event.GetKeyCode() == wx.WXK_F6:
@@ -3141,6 +3257,7 @@ ID_FOCUS_SEND = wx.NewIdRef()
 ID_INTERRUPT_CLAUDE = wx.NewIdRef()
 ID_OPEN_CODEX = wx.NewIdRef()
 ID_CHANGE_CODEX_DIR = wx.NewIdRef()
+ID_REBUILD_WEBVIEW = wx.NewIdRef()
 ID_TAB_1 = wx.NewIdRef()
 ID_TAB_2 = wx.NewIdRef()
 ID_TAB_3 = wx.NewIdRef()
@@ -3202,6 +3319,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(EVT_NAME_CHANGED, self._on_name_changed)
 
+        self._wv_next_check = 0.0
         self._timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_timer, self._timer)
         self._timer.Start(POLL_INTERVAL_MS)
@@ -3333,6 +3451,8 @@ class MainFrame(wx.Frame):
         view_menu.Append(ID_FOCUS_LIST, "Focus &message list\tF2")
         view_menu.Append(ID_FOCUS_HTML, "Focus &content\tF4")
         view_menu.Append(ID_FOCUS_SEND, "Focus &send box\tF5")
+        view_menu.AppendSeparator()
+        view_menu.Append(ID_REBUILD_WEBVIEW, "Re&build content view\tCtrl+Shift+R")
         menubar.Append(view_menu, "&View")
 
         self.SetMenuBar(menubar)
@@ -3353,6 +3473,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._focus_pane(True), id=ID_FOCUS_HTML)
         self.Bind(wx.EVT_MENU, lambda _e: self._focus_send_box(), id=ID_FOCUS_SEND)
         self.Bind(wx.EVT_MENU, self._on_interrupt_claude, id=ID_INTERRUPT_CLAUDE)
+        self.Bind(wx.EVT_MENU, self._on_rebuild_webview, id=ID_REBUILD_WEBVIEW)
         for i, tid in enumerate(_TAB_IDS):
             self.Bind(wx.EVT_MENU, lambda _e, n=i: self._goto_tab(n), id=tid)
 
@@ -3410,6 +3531,7 @@ class MainFrame(wx.Frame):
             (wx.ACCEL_CTRL, ord("W"), ID_CLOSE_TAB),
             (wx.ACCEL_CTRL, wx.WXK_F4, ID_CLOSE_TAB),
             (wx.ACCEL_CTRL, ord("R"), ID_RELOAD),
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("R"), ID_REBUILD_WEBVIEW),
             (wx.ACCEL_CTRL, wx.WXK_TAB, ID_NEXT_TAB),
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_TAB, ID_PREV_TAB),
             # Move-current-tab without wrapping.
@@ -3523,6 +3645,8 @@ class MainFrame(wx.Frame):
         if panel is None:
             return
         if html:
+            wvlog.info("[%s] Focus content requested; %s", panel._wv_name(),
+                       webview_health.native_state(panel.webview.GetHandle()).summary())
             panel.webview.SetFocus()
         else:
             panel.list_box.SetFocus()
@@ -3879,7 +4003,38 @@ class MainFrame(wx.Frame):
                     log.debug("Backend close raised", exc_info=True)
         self.Destroy()
 
+    def _check_webviews(self) -> None:
+        """Every WEBVIEW_CHECK_SEC: log WebView health and rebuild dead ones."""
+        now = time.monotonic()
+        if now < self._wv_next_check:
+            return
+        self._wv_next_check = now + WEBVIEW_CHECK_SEC
+        current = self._current_panel()
+        for i in range(self.notebook.GetPageCount()):
+            page = self.notebook.GetPage(i)
+            if not isinstance(page, ConversationPanel):
+                continue
+            try:
+                state = page.probe_webview(run_js=page is current)
+                if page.webview_broken(state) and now - page._wv_rebuilt_at >= WEBVIEW_REBUILD_MIN_SEC:
+                    page.recreate_webview("its Edge windows or process went away")
+                    if page is current:
+                        self.show_transient_status(
+                            "The content view had stopped working and was rebuilt.",
+                            revert_after_ms=5000,
+                        )
+            except Exception:
+                wvlog.exception("WebView check of page %d failed", i)
+
+    def _on_rebuild_webview(self, _event: wx.CommandEvent) -> None:
+        panel = self._current_panel()
+        if panel is None:
+            return
+        panel.recreate_webview("requested from the menu")
+        self.show_transient_status("Content view rebuilt.", revert_after_ms=3000)
+
     def _on_timer(self, _event: wx.TimerEvent) -> None:
+        self._check_webviews()
         # Poll every page so name changes update tab labels too.
         for i in range(self.notebook.GetPageCount()):
             page = self.notebook.GetPage(i)

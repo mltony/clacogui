@@ -106,6 +106,12 @@ python clacogui.py
 
 Diagnostics go to `clacogui.log` in the same directory as `clacogui.py`.
 The log file is appended to on every run.
+Content-view (WebView) health is also written to `clacogui-webview.log`
+(rotated at 5 MB): every 30 seconds clacogui checks each tab's Edge child
+windows and their processes, pings the current page, and logs any change;
+focus moves into the content view are logged too. A view whose Edge
+windows or process disappear is rebuilt automatically; Ctrl+Shift+R
+rebuilds the current one by hand.
 
 ## Keyboard shortcuts
 
@@ -115,6 +121,7 @@ The log file is appended to on every run.
 | `Ctrl+Shift+O` | Open Codex conversation dialog |
 | `Ctrl+W` (or `Ctrl+F4`) | Close current conversation tab |
 | `Ctrl+R` | Refresh current conversation from disk |
+| `Ctrl+Shift+R` | Rebuild the content view (when the screen reader no longer sees inside it) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous conversation |
 | `Ctrl+1` ... `Ctrl+9` | Switch directly to tab N |
 | `Ctrl+Shift+PgUp` / `Ctrl+Shift+PgDn` | Move current tab left / right |
