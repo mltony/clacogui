@@ -254,9 +254,9 @@ _OUTGOING_MAX_AGE_SEC = 300  # 5 minutes
 # while a shell command is running (the shell buffers the bytes, then
 # claude picks them back up when the shell exits and hands the TUI
 # back the line editor -- this is the same behaviour the user sees
-# when they type directly).  Anything else (``busy``, ``compacting``,
-# ``unknown``) blocks the send; the file stays queued and retries on
-# the next status transition.
+# when they type directly).  Other statuses block the send, except
+# ``busy`` with a confirmed main-turn completion (see below). Blocked
+# files stay queued and retry on the next tick.
 _INJECTABLE_STATUSES = frozenset({"idle", "shell"})
 
 # Claude keeps reporting ``busy`` for as long as a background agent
@@ -489,7 +489,8 @@ def _main_turn_ended(path: Optional[str]) -> bool:
     True iff the first ``user``/``assistant``/``turn_duration`` entry
     found is ``turn_duration``.  Any user or assistant entry after it
     means a turn is in flight.  Returns False when unsure (no file, no
-    match in the window), so the caller keeps blocking.
+    match in the window, or an incomplete/invalid record), so the caller
+    keeps blocking.
     """
     if not path:
         return False
@@ -511,8 +512,10 @@ def _main_turn_ended(path: Optional[str]) -> bool:
         try:
             entry = json.loads(raw)
         except ValueError:
-            continue
-        if not isinstance(entry, dict) or entry.get("isSidechain"):
+            return False
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("isSidechain"):
             continue
         kind = entry.get("type")
         if kind == "system":
@@ -834,6 +837,8 @@ class Launcher:
         # Cheap; the file is tiny and we're already polling at 200 ms.
         meta = _read_session_metadata(self._claude_pid)
         self._claude_status_checked_at = time.monotonic()
+        # Only current, confirmed metadata may open the busy send gate.
+        self._transcript = None
         if not meta:
             return
         st = meta.get("status")
@@ -904,9 +909,9 @@ class Launcher:
             return False, "session_unknown"
         # Injection is safe in ``idle`` (TUI prompt open) and ``shell``
         # (claude spawned a foreground subprocess on our PTY slave;
-        # bytes reach it directly).  Everything else -- ``busy``,
-        # ``compacting``, ``unknown``, future values -- blocks so we
-        # never race into a state we haven't validated.
+        # bytes reach it directly). ``busy`` is also allowed when the
+        # current transcript confirms the main turn has ended. Other
+        # statuses and unconfirmed busy turns keep messages queued.
         if self._claude_status not in _INJECTABLE_STATUSES and not (
             self._claude_status == "busy" and _main_turn_ended(self._transcript)
         ):
