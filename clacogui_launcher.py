@@ -259,6 +259,15 @@ _OUTGOING_MAX_AGE_SEC = 300  # 5 minutes
 # the next status transition.
 _INJECTABLE_STATUSES = frozenset({"idle", "shell"})
 
+# Claude keeps reporting ``busy`` for as long as a background agent
+# runs, even after the main turn has ended and the prompt is back up
+# ("Waiting for N background agents to finish").  In that state the
+# prompt takes input exactly as in ``idle``, so ``busy`` is injectable
+# when the transcript shows the main turn closed: its last main-chain
+# entry is the ``system``/``turn_duration`` record claude writes when a
+# turn ends.  How many trailing bytes of the transcript we scan for it.
+_TURN_END_SCAN_BYTES = 256 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Logging -- mirror the agent's append-only log style
@@ -470,6 +479,49 @@ def _canonical_session_id(meta: Optional[dict]) -> Optional[str]:
     except OSError:
         pass
     return None
+
+
+def _main_turn_ended(path: Optional[str]) -> bool:
+    """Whether the transcript's last main-chain entry closes a turn.
+
+    Scans the last ``_TURN_END_SCAN_BYTES`` of ``path`` backwards,
+    skipping sidechain entries and non-message records, and returns
+    True iff the first ``user``/``assistant``/``turn_duration`` entry
+    found is ``turn_duration``.  Any user or assistant entry after it
+    means a turn is in flight.  Returns False when unsure (no file, no
+    match in the window), so the caller keeps blocking.
+    """
+    if not path:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - _TURN_END_SCAN_BYTES)
+            f.seek(start)
+            data = f.read()
+    except OSError:
+        return False
+    lines = data.split(b"\n")
+    if start > 0:
+        lines = lines[1:]  # first line is cut mid-record
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("isSidechain"):
+            continue
+        kind = entry.get("type")
+        if kind == "system":
+            if entry.get("subtype") == "turn_duration":
+                return True
+            continue
+        if kind in ("user", "assistant"):
+            return False
+    return False
 
 
 def _wait_for_session_id(
@@ -686,6 +738,10 @@ class Launcher:
         # tick.  Anything that isn't "idle" means we don't inject.
         self._claude_status: str = "unknown"
         self._claude_status_checked_at: float = 0.0
+        # Transcript of the current session, from the same metadata,
+        # for telling a ``busy`` main turn from a finished one with
+        # background agents still running (see ``_main_turn_ended``).
+        self._transcript: Optional[str] = None
         # The UserBufferTracker counts printable bytes typed through us,
         # but during startup/resume it also sees keystrokes and echoes
         # that never land in claude's (not-yet-ready) prompt -- leaving a
@@ -824,6 +880,8 @@ class Launcher:
         # opens conversations by JSONL filename), so this puts the
         # two sides in lock-step.
         sid = _canonical_session_id(meta)
+        if sid:
+            self._transcript = _transcript_path(meta)
         if sid and sid != self._session_id:
             if self._session_id is None:
                 _log("session_id discovered (late)", {"sid": sid})
@@ -849,7 +907,9 @@ class Launcher:
         # bytes reach it directly).  Everything else -- ``busy``,
         # ``compacting``, ``unknown``, future values -- blocks so we
         # never race into a state we haven't validated.
-        if self._claude_status not in _INJECTABLE_STATUSES:
+        if self._claude_status not in _INJECTABLE_STATUSES and not (
+            self._claude_status == "busy" and _main_turn_ended(self._transcript)
+        ):
             return False, f"claude_{self._claude_status}"
         # Check the quiet window *before* the buffer estimate.  The
         # caller turns ``user_has_uncommitted_text`` into an

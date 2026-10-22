@@ -164,6 +164,14 @@ will inject right away) or is going to sit in the queue
 (`Claude: busy` &rarr; the launcher is gating until claude
 finishes).  When in doubt, `Ctrl+.` sends Esc to cancel.
 
+Claude also reports `busy` while only a background agent is running
+and its prompt is back up ("Waiting for N background agents to
+finish").  The launcher delivers messages in that state too: it treats
+`busy` as sendable when the session transcript's last main-chain entry
+is the `turn_duration` record that closes a turn.  Esc does nothing
+there, since there is no foreground turn to cancel; to stop the
+background agent, send claude a message asking it to.
+
 ## Screen-reader URL
 
 `wx.html2.WebView` exposes its document URL via UIA / IAccessible2, which is
