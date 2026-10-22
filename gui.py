@@ -1429,6 +1429,13 @@ class ConversationPanel(wx.Panel):
         """Whether the rollout shows a turn in progress (Codex tabs only)."""
         return bool(getattr(self._data, "busy", False))
 
+    def main_turn_ended(self) -> bool:
+        """Whether the transcript shows the main turn closed (Claude tabs).
+
+        False when it can't tell (no transcript loaded, no turn seen yet).
+        """
+        return getattr(self._data, "main_turn_open", None) is False
+
     def _parse_fn(self) -> Callable[[FsBackend, str], ConversationData]:
         """The transcript parser for this tab; captured on the UI thread."""
         if self.is_codex:
@@ -1931,7 +1938,7 @@ class ConversationPanel(wx.Panel):
         if self.is_codex:
             self._apply_incremental_codex(tail_text, sig, base_offset)
             return
-        from models import _extract_user_text, _extract_assistant_text
+        from models import _extract_user_text, _extract_assistant_text, track_main_turn
 
         old_count = len(self._data.turns)
         old_selection = self.list_box.GetSelection()
@@ -1973,6 +1980,7 @@ class ConversationPanel(wx.Panel):
             except ValueError:
                 continue
 
+            track_main_turn(self._data, entry)
             etype = entry.get("type")
             if etype == "custom-title":
                 self._data.custom_title = entry.get("customTitle") or self._data.custom_title
@@ -3594,8 +3602,9 @@ class MainFrame(wx.Frame):
         ``Claude: busy``).  Returns an empty string when there's no
         active tab, no session_id yet, or no metadata file matching
         the tab's session_id.  Status strings come straight from
-        claude's own metadata ``status`` field; we don't translate
-        them so what the launcher sees is what shows up here.
+        claude's own metadata ``status`` field, so what the launcher
+        sees is what shows up here -- except ``busy`` after the main
+        turn ended, shown as ``background``.
         """
         sid = self._claude_session_id_for_active_tab()
         if not sid:
@@ -3612,6 +3621,11 @@ class MainFrame(wx.Frame):
         status = self._claude_status_map.get(sid)
         if not status:
             return "Claude: not running"
+        # Claude stays "busy" while a background agent runs, even after
+        # the turn ended and the prompt is back up; messages are delivered
+        # in that state (the launcher checks the same transcript record).
+        if status == "busy" and panel is not None and panel.main_turn_ended():
+            return "Claude: background"
         return f"Claude: {status}"
 
     def _refresh_claude_status_field(self) -> None:

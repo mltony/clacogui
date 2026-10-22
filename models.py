@@ -88,6 +88,23 @@ class ConversationData:
     # response.  Lets the live view dedup incremental reads after a full
     # reload (see GUI ``_apply_incremental``).
     assistant_uuids: set = field(default_factory=set)
+    # Whether the main chain has a turn in flight: set by any main-chain
+    # user/assistant entry, cleared by the ``turn_duration`` record claude
+    # writes when a turn ends.  None until either is seen.  Claude reports
+    # ``busy`` while a background agent runs even after the turn ended, so
+    # this is what tells that state apart (see ``track_main_turn``).
+    main_turn_open: Optional[bool] = None
+
+
+def track_main_turn(data: ConversationData, entry: dict) -> None:
+    """Update ``data.main_turn_open`` from one transcript entry."""
+    if entry.get("isSidechain"):
+        return
+    etype = entry.get("type")
+    if etype in ("user", "assistant"):
+        data.main_turn_open = True
+    elif etype == "system" and entry.get("subtype") == "turn_duration":
+        data.main_turn_open = False
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +288,7 @@ def parse_conversation(backend: FsBackend, rel_path: str) -> ConversationData:
             if sid:
                 data.session_id = sid
 
+        track_main_turn(data, entry)
         etype = entry.get("type")
         if etype == "custom-title":
             data.custom_title = entry.get("customTitle") or data.custom_title
