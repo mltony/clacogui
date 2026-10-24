@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
+import metadata_cache
 import transcript_cache
 from fs import FsBackend
 from models import ConversationData, ConversationInfo, Turn
@@ -254,25 +255,24 @@ def read_launcher_states(backend: FsBackend) -> dict[str, LauncherState]:
     try:
         entries = backend.list_dir(LAUNCHER_SESSIONS_DIR)
     except FileNotFoundError:
+        metadata_cache.prune(backend, LAUNCHER_SESSIONS_DIR, [])
         return {}
     except OSError:
         log.debug("list_dir(%s) failed", LAUNCHER_SESSIONS_DIR, exc_info=True)
         return {}
+    metadata_cache.prune(backend, LAUNCHER_SESSIONS_DIR, entries)
     cutoff = time.time() - LAUNCHER_STALE_SEC
     candidates = sorted(
-        (
-            (e.mtime or 0.0, e.name)
-            for e in entries
-            if not e.is_dir
-            and e.name.endswith(".json")
-            and not (e.mtime and e.mtime < cutoff)
-        ),
-        reverse=True,
+        (e for e in entries if not e.is_dir and e.name.endswith(".json")
+         and not (e.mtime and e.mtime < cutoff)),
+        key=lambda e: (e.mtime or 0.0, e.name), reverse=True,
     )
     out: dict[str, LauncherState] = {}
-    for _mtime, fname in candidates:
+    for entry in candidates:
         try:
-            data = json.loads(backend.read_text(f"{LAUNCHER_SESSIONS_DIR}/{fname}"))
+            data = metadata_cache.read_json(
+                backend, f"{LAUNCHER_SESSIONS_DIR}/{entry.name}", entry,
+            )
         except (OSError, ValueError, TypeError):
             continue
         if not isinstance(data, dict):

@@ -38,6 +38,8 @@ except ImportError:  # not on Windows; we'll fall back to wx.Bell
     winsound = None  # type: ignore[assignment]
 
 import models
+import io_jobs
+import metadata_cache
 import transcript_cache
 import webview_health
 from fs import FsBackend, FtpBackend, make_backend
@@ -326,6 +328,7 @@ CONFIG_PATH = os.path.join(
 )
 
 POLL_INTERVAL_MS = 200
+BACKGROUND_POLL_INTERVAL_SEC = 2.0
 WEBVIEW_CHECK_SEC = 30
 WEBVIEW_REBUILD_MIN_SEC = 120
 PENDING_TAB_RETRY_SEC = 15.0
@@ -430,41 +433,12 @@ def _set_window_appid(hwnd: int) -> None:
 # Background IO worker thread
 # ---------------------------------------------------------------------------
 #
-# All Claude Code data lives on a network share, so any file read can stall
-# for a few hundred ms.  We keep the UI thread off the disk by handing reads
-# to a single background thread and posting results back via wx.CallAfter.
-#
-# A *single* thread (not a pool) is intentional:
-#
-#   * The bottleneck is the SMB share, not CPU. Parallel reads against a
-#     slow share usually make it slower, not faster, because the server has
-#     to thrash between handles.
-#   * Serialising IO means at most one outstanding stat()/read() at any
-#     moment, which is the gentlest pattern for a flaky share.
-#   * Each panel already de-duplicates its own jobs (``_polling`` /
-#     ``_loading`` flags), so the queue can never grow without bound.
+# Visible transcript reads have their own worker. Background tabs, folder
+# scans and metadata share the other read worker; writes remain independent.
+# FtpBackend keeps a separate control connection per thread.
 
-_io_queue: "queue.Queue[Optional[tuple[Callable, Callable]]]" = queue.Queue()
+_read_workers = io_jobs.ReadWorkers(wx.CallAfter)
 _io_write_queue: "queue.Queue[Optional[tuple[Callable, Callable]]]" = queue.Queue()
-
-
-def _io_worker_loop() -> None:
-    while True:
-        item = _io_queue.get()
-        if item is None:
-            return  # shutdown sentinel
-        fn, on_done = item
-        try:
-            result = fn()
-            exc: Optional[BaseException] = None
-        except BaseException as e:  # noqa: BLE001
-            log.exception("Background IO failed")
-            result = None
-            exc = e
-        try:
-            wx.CallAfter(on_done, result, exc)
-        except Exception:
-            log.exception("wx.CallAfter dispatch failed")
 
 
 def _io_write_worker_loop() -> None:
@@ -489,13 +463,6 @@ def _io_write_worker_loop() -> None:
             log.exception("wx.CallAfter dispatch failed")
 
 
-_io_thread = threading.Thread(
-    target=_io_worker_loop,
-    name="clacogui-io",
-    daemon=True,
-)
-_io_thread.start()
-
 _io_write_thread = threading.Thread(
     target=_io_write_worker_loop,
     name="clacogui-io-write",
@@ -508,7 +475,7 @@ _io_write_thread.start()
 def _shutdown_io_thread() -> None:
     log.debug("Shutting down IO threads")
     try:
-        _io_queue.put_nowait(None)
+        _read_workers.close()
     except Exception:
         pass
     try:
@@ -520,19 +487,15 @@ def _shutdown_io_thread() -> None:
 def submit_io(
     fn: Callable,
     on_done: Callable[[object, Optional[BaseException]], None],
-) -> None:
-    """Run ``fn()`` on the background IO thread, then call
-    ``on_done(result, exc)`` on the wx main thread.
+    *, foreground: bool = False, label: Optional[str] = None,
+) -> io_jobs.ReadJob:
+    """Read off the UI thread and deliver results through wx.CallAfter.
 
-    Jobs are processed strictly in submission order on a single thread.
-    Exceptions raised by ``fn`` are caught and forwarded as ``exc`` (with
-    ``result`` set to ``None``).
-
-    ``on_done`` must always start with ``if not window:`` (or equivalent)
-    before touching wx state, because the window may have been destroyed
-    while the read was queued.
+    Foreground work has its own worker. A returned job can be promoted
+    while waiting; work that has already started is never duplicated.
+    Callbacks must check that their window still exists.
     """
-    _io_queue.put((fn, on_done))
+    return _read_workers.submit(fn, on_done, foreground=foreground, label=label)
 
 
 def submit_io_write(
@@ -609,7 +572,8 @@ def submit_io_with_retry(
     fn: Callable,
     on_success: Callable[[object], None],
     on_give_up: Optional[Callable[[BaseException], None]] = None,
-) -> None:
+    *, foreground: bool = False,
+) -> io_jobs.ReadJob:
     """Async ``submit_io`` that pops a Retry/Quit dialog on ``OSError``.
 
     On success: ``on_success(result)`` is called on the wx thread.
@@ -671,7 +635,10 @@ def submit_io_with_retry(
             _io_dialog_active = False
 
         if choice == wx.ID_YES:
-            submit_io_with_retry(parent, op_label, fn, on_success, on_give_up)
+            submit_io_with_retry(
+                parent, op_label, fn, on_success, on_give_up,
+                foreground=foreground,
+            )
             return
 
         if on_give_up is not None:
@@ -681,7 +648,7 @@ def submit_io_with_retry(
             if top is not None:
                 top.Close(force=True)
 
-    submit_io(fn, callback)
+    return submit_io(fn, callback, foreground=foreground, label=op_label)
 
 
 # ---------------------------------------------------------------------------
@@ -1351,6 +1318,11 @@ class ConversationPanel(wx.Panel):
         self._poll_started_at: Optional[float] = None
         self._loading = False
         self._polling = False
+        self._load_job = None
+        self._poll_job = None
+        self._poll_again = False
+        self._poll_again_foreground = False
+        self._next_background_poll = 0.0
         # Poll jobs carry a generation number.  ``_polling`` is meant to keep
         # only one read in flight, but the 30s watchdog below can clear it
         # while the original job is still running (``submit_io`` has no
@@ -1816,6 +1788,7 @@ class ConversationPanel(wx.Panel):
             if not self:
                 return
             self._loading = False
+            self._load_job = None
             data, sig = result
             self._data = data
             self._signature = sig
@@ -1828,6 +1801,9 @@ class ConversationPanel(wx.Panel):
             self._refresh_list(preserve_selection=not initial)
             self._refresh_html()
             self._notify_name_change()
+            if self._poll_again:
+                self._poll_again = False
+                self.poll(foreground=self._poll_again_foreground, urgent=True)
             if feedback:
                 stamp = time.strftime("%H:%M:%S")
                 self._set_status(
@@ -1839,6 +1815,7 @@ class ConversationPanel(wx.Panel):
             if not self:
                 return
             self._loading = False
+            self._load_job = None
             if feedback:
                 self._set_status(
                     "Refresh failed; existing data unchanged.",
@@ -1852,7 +1829,10 @@ class ConversationPanel(wx.Panel):
             if top is not None:
                 top.Close(force=True)
 
-        submit_io_with_retry(self, op, work, on_success, on_give_up=on_give_up)
+        self._load_job = submit_io_with_retry(
+            self, op, work, on_success, on_give_up=on_give_up,
+            foreground=feedback,
+        )
 
     def _set_status(self, message: str, revert_after_ms: int = 0) -> None:
         """Write a transient message to the parent frame's status bar.
@@ -1865,16 +1845,29 @@ class ConversationPanel(wx.Panel):
             return
         frame.show_transient_status(message, revert_after_ms=revert_after_ms)
 
-    def poll(self) -> None:
-        """Tick called every second by ``MainFrame``.
+    def poll(self, *, foreground: bool = False, urgent: bool = False) -> None:
+        """Read appended records, using the active lane when requested.
 
         Cheap-checks ``stat()`` first, only re-parses if size or mtime
         changed.  Skips entirely if a previous tick is still running, so a
         slow share never piles up jobs.  All errors are swallowed and logged.
         """
         if self._loading:
+            if foreground and self._load_job is not None:
+                self._load_job.promote()
+            if urgent:
+                self._poll_again = True
+                self._poll_again_foreground = foreground
             return
         if self._polling:
+            if foreground:
+                if self._poll_job is not None:
+                    self._poll_job.promote()
+            if urgent:
+                # The current read may predate the completion event. Read
+                # again after applying it rather than overlapping offsets.
+                self._poll_again = True
+                self._poll_again_foreground = foreground
             # If we've been "polling" for unreasonably long, assume the
             # callback was lost (this should never happen but guard anyway)
             # and free the flag so we don't deadlock the panel forever.
@@ -1894,8 +1887,12 @@ class ConversationPanel(wx.Panel):
                 self._polling = False
             else:
                 return
+        now = time.monotonic()
+        if not (foreground or urgent) and now < self._next_background_poll:
+            return
+        self._next_background_poll = now + BACKGROUND_POLL_INTERVAL_SEC
         self._polling = True
-        self._poll_started_at = time.monotonic()
+        self._poll_started_at = now
 
         backend = self.backend
         rel_path = self.rel_path
@@ -1923,14 +1920,20 @@ class ConversationPanel(wx.Panel):
             # Incremental: if file grew (append-only) and we have prior data,
             # read only the tail.
             if prev_size > 0 and new_size > prev_size:
+                started = time.monotonic()
                 tail_text = transcript_cache.read_text_from(backend, rel_path, prev_size)
+                log.info(
+                    "Transcript read: %s offset=%d bytes=%d read=%.1fms",
+                    rel_path, prev_size, len(tail_text.encode("utf-8")),
+                    (time.monotonic() - started) * 1000,
+                )
                 return (sig, None, tail_text)
             # Full re-read: first load, or the stored offset is somehow ahead
             # of the file, in which case reloading resets it to a real size.
             data = parse(backend, rel_path)
             return (sig, data, None)
 
-        def callback(result, exc):
+        def apply_result(result, exc):
             if not self:
                 return
             # Only the newest submitted job owns the flag; an older callback
@@ -2041,7 +2044,18 @@ class ConversationPanel(wx.Panel):
             if data.name != old_name:
                 self._notify_name_change()
 
-        submit_io(work, callback)
+        def callback(result, exc):
+            try:
+                apply_result(result, exc)
+            finally:
+                if self and gen == self._inflight_gen and self._poll_again:
+                    self._poll_again = False
+                    self.poll(foreground=self._poll_again_foreground, urgent=True)
+
+        self._poll_job = submit_io(
+            work, callback, foreground=foreground,
+            label=f"transcript {self.provider} {rel_path}",
+        )
 
     def _apply_incremental(
         self, tail_text: str, sig: tuple[float, int], base_offset: int
@@ -2393,6 +2407,15 @@ class ConversationPanel(wx.Panel):
         return f"clacogui://{sid}/message/{turn.order}"
 
     def _refresh_html(self) -> None:
+        started = time.monotonic()
+        try:
+            self._refresh_html_impl()
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed >= 0.1:
+                log.info("Render timing: %s %.1fms", self.rel_path, elapsed * 1000)
+
+    def _refresh_html_impl(self) -> None:
         """Render the current selection into the WebView.
 
         Two paths:
@@ -4056,12 +4079,14 @@ class MainFrame(wx.Frame):
 
     def _on_timer(self, _event: wx.TimerEvent) -> None:
         self._check_webviews()
-        # Poll every page so name changes update tab labels too.
+        # Keep the active transcript responsive; background tabs check at
+        # most every two seconds, including their tab-name updates.
+        active = self.notebook.GetSelection()
         for i in range(self.notebook.GetPageCount()):
             page = self.notebook.GetPage(i)
             if isinstance(page, ConversationPanel):
                 try:
-                    page.poll()
+                    page.poll(foreground=(i == active))
                 except Exception:
                     log.exception("Polling page %d crashed", i)
         try:
@@ -4200,14 +4225,14 @@ class MainFrame(wx.Frame):
         submit_io(work, on_done)
 
     def _on_active_poll_timer(self, _event: wx.TimerEvent) -> None:
-        """Fast poll: incremental read for the active tab at 500ms."""
+        """Incremental read for the active tab every 200ms."""
         sel = self.notebook.GetSelection()
         if sel < 0:
             return
         page = self.notebook.GetPage(sel)
         if isinstance(page, ConversationPanel):
             try:
-                page.poll()
+                page.poll(foreground=True)
             except Exception:
                 log.debug("Active poll crashed", exc_info=True)
 
@@ -4449,6 +4474,17 @@ class MainFrame(wx.Frame):
                         "outgoing snapshot dispatch crashed for page %d", i
                     )
 
+    def _refresh_completed_transcripts(self, backend: FsBackend) -> None:
+        active = self.notebook.GetSelection()
+        indices = list(range(self.notebook.GetPageCount()))
+        if active in indices:
+            indices.remove(active)
+            indices.insert(0, active)
+        for i in indices:
+            page = self.notebook.GetPage(i)
+            if isinstance(page, ConversationPanel) and page.backend is backend:
+                page.poll(foreground=(i == active), urgent=True)
+
     def _handle_new_notifications(
         self, names: list[str], backend: Optional[FsBackend] = None
     ) -> None:
@@ -4503,6 +4539,8 @@ class MainFrame(wx.Frame):
         # same poll cycle, the completion sound wins -- that's the
         # "Claude finished" cue the user explicitly cares about.
         if ring_completion:
+            log.info("Completion notification: requesting transcript refresh")
+            self._refresh_completed_transcripts(backend)
             _play_notification_sound(completion=True)
         elif ring_default:
             _play_notification_sound()
@@ -5641,30 +5679,28 @@ def _read_claude_session_state(
     try:
         entries = backend.list_dir(CLAUDE_SESSIONS_DIR)
     except FileNotFoundError:
+        metadata_cache.prune(backend, CLAUDE_SESSIONS_DIR, [])
         return {}, {}
     except OSError:
         log.debug("list_dir(%s) failed", CLAUDE_SESSIONS_DIR, exc_info=True)
         return {}, {}
+    metadata_cache.prune(backend, CLAUDE_SESSIONS_DIR, entries)
     cutoff = time.time() - STALE_CLAUDE_SESSION_AGE_SEC
-    candidates: list[tuple[float, str]] = []
+    candidates = []
     for e in entries:
         if e.is_dir or not e.name.endswith(".json"):
             continue
         if e.mtime and e.mtime < cutoff:
             continue
-        candidates.append((e.mtime or 0.0, e.name))
-    candidates.sort(reverse=True)
+        candidates.append(e)
+    candidates.sort(key=lambda e: (e.mtime or 0.0, e.name), reverse=True)
     statuses: dict[str, str] = {}
     names: dict[str, str] = {}
-    for _mtime, fname in candidates:
-        rel = f"{CLAUDE_SESSIONS_DIR}/{fname}"
+    for entry in candidates:
+        rel = f"{CLAUDE_SESSIONS_DIR}/{entry.name}"
         try:
-            text = backend.read_text(rel)
-        except OSError:
-            continue
-        try:
-            data = json.loads(text)
-        except (ValueError, TypeError):
+            data = metadata_cache.read_json(backend, rel, entry)
+        except (OSError, ValueError, TypeError):
             continue
         if not isinstance(data, dict):
             continue

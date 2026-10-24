@@ -14,7 +14,7 @@ env/
 .clacogui_config.json
 
 # Personal launcher (may embed CLACOGUI_FTP_PASSWORD in plain text)
-run_hidden.vbs
+run_hidden*.vbs
 clacogui.secrets.txt
 
 # Editor / IDE

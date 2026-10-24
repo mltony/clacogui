@@ -207,22 +207,35 @@ the file is re-polled and the page is rebuilt.
 
 ## Threading
 
-All filesystem access (the open-dialog scan, the initial read of an opened
-conversation, every poll tick) goes through a **single** background thread
-fed by a FIFO queue. Choosing one thread instead of a pool is deliberate:
+Reads use two background workers: one for the visible transcript and one
+for background tabs, directory scans and session metadata. Writes use a
+third worker, so sending a message never waits behind a transcript read.
+FTP control connections are private to each worker thread.
 
-- The bottleneck is the SMB share, not CPU. Issuing several reads in
-  parallel against a slow share tends to make it slower, not faster.
-- Serialising guarantees at most one outstanding `stat()`/`read()` at any
-  moment, which is the gentlest pattern for a flaky network filesystem.
-- Each `ConversationPanel` de-duplicates its own jobs with `_polling` and
-  `_loading` flags, so the queue can never grow without bound: if the
-  previous poll is still in flight when the 1 s timer fires again, the new
-  tick is simply dropped.
+- The active tab checks for appended records every 200 ms. Background tabs
+  check at most once every 2 seconds. A queued background read is promoted
+  when its tab becomes active; it still executes only once.
+- Both Claude and Codex read only appended transcript bytes. FTP uses
+  `REST` offsets; opening a conversation also uses the local transcript
+  cache when available.
+- Session metadata JSON is cached by the directory listing's modification
+  time and size. Changes invalidate it immediately. It is re-read after
+  2 seconds even with an unchanged signature, to handle coarse timestamps.
+- Completion notifications request a refresh of that backend's open tabs,
+  giving the visible tab priority. If a read is already running, another
+  read follows it without overlapping transcript offsets. The sound still
+  plays promptly; it does not wait for rendering.
 
-When the worker finishes, the result is posted back to the wx main thread
-with `wx.CallAfter`. Every callback short-circuits with `if not self:` so a
-tab that was closed mid-IO doesn't crash on a destroyed wx object.
+Results return to the wx main thread through `wx.CallAfter`. Each panel
+keeps one normal read outstanding, with generation and byte-offset guards
+for late callbacks. Callbacks check whether their window still exists.
+
+To diagnose delays, `clacogui.log` includes `IO timing` entries when queue,
+execution, UI dispatch or callback time reaches 250 ms. `FTP timing` and
+`Render timing` entries report operations taking at least 100 ms. Changed
+transcripts also log their read offset, byte count and read duration.
+Render timings measure Python rendering and WebView update calls, not the
+browser's eventual paint or a screen reader's response.
 
 ## F5 / Ctrl+R is *not* fire-and-forget
 
@@ -284,8 +297,9 @@ turn it off only if the client cache disable above isn't enough.
 
 If a different host is the one writing the JSONL files (e.g. Claude Code
 running in a Linux VM/container while you read from Windows), and the
-server is a Linux Samba host, the cache settings above plus a 1 s
-clacogui poll loop will catch every change in well under 2 s.
+server is a Linux Samba host, the cache settings above can help expose
+changes promptly. The active tab checks every 200 ms and background tabs
+every 2 seconds; network delays and server caching can add to that.
 
 ## Resilience
 

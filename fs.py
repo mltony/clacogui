@@ -25,6 +25,7 @@ import logging
 import os
 import posixpath
 import threading
+import time
 from calendar import timegm
 from dataclasses import dataclass
 from typing import Optional
@@ -440,6 +441,16 @@ class FtpBackend(FsBackend):
             pass
 
     def _retry(self, fn):
+        started = time.monotonic()
+        try:
+            return self._retry_impl(fn)
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed >= 0.1:
+                # Operation names contain no URL, password or file contents.
+                log.info("FTP timing: %s %.1fms", fn.__qualname__, elapsed * 1000)
+
+    def _retry_impl(self, fn):
         """Run ``fn()``; on a transport error, reconnect once and retry.
 
         ``error_perm`` (5xx) is treated as an application-level failure --
