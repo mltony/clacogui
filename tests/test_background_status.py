@@ -21,7 +21,7 @@ ASSISTANT = {
 
 def parse_records(*records):
     text = "".join(json.dumps(record) + "\n" for record in records)
-    backend = SimpleNamespace(read_text=lambda path: text, cache_transcripts=False)
+    backend = SimpleNamespace(read_text=lambda path, encoding="utf-8": text, cache_transcripts=False)
     return models.parse_conversation(backend, "session.jsonl")
 
 
