@@ -42,6 +42,14 @@ class TestReadWorkers(unittest.TestCase):
         self.deliver()
         self.assertEqual(received, [("active", None)])
 
+    def test_index_scan_finishes_while_background_is_blocked(self):
+        self.block_background()
+        received = []
+        job = self.workers.submit(lambda: "index", lambda value, exc: received.append(value), index=True)
+        self.assertFalse(job.promote())
+        self.deliver()
+        self.assertEqual(received, ["index"])
+
     def test_promoted_job_runs_once_and_no_longer_blocks_background(self):
         self.block_background()
         executions, received = [], []

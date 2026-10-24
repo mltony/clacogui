@@ -12,7 +12,7 @@ readers (NVDA, JAWS).
   `<root>/projects/<project>/<sessionId>.jsonl`.
 - Reads matching session names from `<root>/sessions/*.json`.
 - Lets you keep multiple conversations open as tabs.
-- Polls every second so new messages and renamed sessions show up live.
+- Polls the active tab every 200 ms and background tabs every 2 seconds.
 - Over FTP, keeps a local copy of each opened transcript in
   `%LOCALAPPDATA%\clacogui\transcripts`, so reopening a tab (e.g. at
   startup) downloads only what was appended since.  Copies unused for 30
@@ -27,7 +27,8 @@ readers (NVDA, JAWS).
 - a **local or SMB-mapped path**, e.g. `X:\.claude`, `\\server\share\.claude`,
   `/home/me/.claude`; or
 - an **FTP URL**, e.g.
-  `ftp://ftpuser:<password>@localhost:2121/home/me/.claude`.
+  `ftp://ftpuser:<password>@localhost:2121/home/me/.claude`; or
+- an **SFTP URL**, e.g. `sftp://me@host:22/home/me/.claude`.
 
 The FTP path is recommended when the Linux side runs Claude Code and you
 view from Windows, because Windows aggressively caches SMB metadata
@@ -70,9 +71,72 @@ python -m pyftpdlib -u ftpuser -P "$CLACOGUI_FTP_PASSWORD" \
   --range 60000-60009 -d / -w
 ```
 
-If your WSL account doesn't match your Windows `%USERNAME%`, override the
-remote home with `CLACOGUI_WSL_HOME`, e.g.
-`setx CLACOGUI_WSL_HOME /home/me/.claude`.
+Configure the FTP endpoint and directories on that host with:
+
+```bat
+setx CLACOGUI_PROTOCOL ftp
+setx CLACOGUI_HOST localhost
+setx CLACOGUI_PORT 2121
+setx CLACOGUI_USER ftpuser
+setx CLACOGUI_CLAUDE_DIR /home/me/.claude
+setx CLACOGUI_CODEX_DIR /home/me/.codex
+```
+
+Use the server's host IP or hostname, including when its ports are forwarded
+into WSL. No WSL guest-IP lookup or generated address file is used. The
+older `CLACOGUI_WSL_HOME` and `CLACOGUI_WSL_CODEX_HOME` variables remain
+supported by `run.cmd` when the corresponding new variable is unset, as do
+the `CLACOGUI_FTP_HOST`, `CLACOGUI_FTP_PORT`, and `CLACOGUI_FTP_USER` aliases.
+
+### Hidden launcher profiles
+
+The private `run_hidden.vbs` and `run_hidden_per.vbs` files each specify
+`host`, `port`, `user`, `password`, `claudeDirectory`, `codexDirectory`, and
+`logName` in one settings block. They load the shared `launch_hidden.vbs`
+helper, which sets those values for the child process and launches
+`run.cmd` without a console. Both directories must be paths on the
+configured server. Specify both to avoid restoring another profile's
+saved folder.
+
+The profile files match the Git ignore rule `run_hidden*.vbs`; the shared
+helper contains no personal settings. Each profile uses its own launch
+log. Explicit arguments passed to a profile override its default targets,
+just as they do for `run.cmd`.
+
+### SFTP over SSH
+
+SFTP supports the same transcript polling, local transcript cache,
+notifications, permissions, and outgoing-message files as FTP, for both
+Claude and Codex. Each IO worker has its own persistent SSH/SFTP connection.
+Reads seek to the previous byte offset; large downloads use bounded
+prefetching. It connects directly to the SSH server; no FTP server is needed.
+
+```bat
+run.cmd sftp://me@host:22/home/me/.claude --codex sftp://me@host:22/home/me/.codex
+```
+
+Paramiko is installed with the other requirements. Authentication uses
+`%USERPROFILE%\.ssh\id_ed25519` with SSH agent access and automatic key
+discovery disabled. Host verification loads the existing
+`%USERPROFILE%\.ssh\known_hosts` and rejects unknown or changed keys.
+Set `CLACOGUI_SSH_KEY` and `CLACOGUI_SSH_KNOWN_HOSTS` to use different files.
+Passwords in SFTP URLs are not used or accepted.
+
+The private `run_hidden_sftp.vbs` profile specifies the host, SSH port,
+username, key file, known-hosts file, and both absolute remote directories.
+It uses `LaunchHiddenSftp` in the shared helper and writes
+`clacogui-launch-sftp.log`. Like the other private profiles it is Git-ignored.
+Use a resolvable host name or IP: Paramiko does not expand OpenSSH config
+aliases or `ProxyJump` settings. If an SSH alias differs from the real
+host name, obtain the latter with `ssh -G <alias>` and set `host` accordingly.
+
+Existing hooks and launchers work unchanged when switching transports. To
+install them on another host through SFTP:
+
+```bat
+install_agent.cmd sftp://me@host/home/me/.claude --python python3 --yes
+install_agent.cmd --codex sftp://me@host/home/me/.codex --python python3 --yes
+```
 
 If you'd rather use a direct path, an SMB share, or a different FTP host
 (e.g. when reaching a remote box through SSH port forwarding), just pass
@@ -110,7 +174,7 @@ python -m pip install -r requirements.txt
 python clacogui.py
 ```
 
-(`wxPython` and `markdown`. Python 3.10+ recommended.)
+(`wxPython`, `markdown`, and `paramiko`. Python 3.10+ recommended.)
 
 Diagnostics go to `clacogui.log` in the same directory as `clacogui.py`.
 The log file is appended to on every run.
@@ -122,6 +186,11 @@ windows or process disappear is rebuilt automatically; Ctrl+Shift+R
 rebuilds the current one by hand.
 
 ## Keyboard shortcuts
+
+The complete maintained inventory, including dialog and button mnemonics,
+is in [KEYBOARD_SHORTCUTS.md](KEYBOARD_SHORTCUTS.md). Application-wide keys
+come from one registry shared by native wx accelerators and WebView handling;
+they also work inside code-block textareas.
 
 | Shortcut | Action |
 | --- | --- |
@@ -140,6 +209,7 @@ rebuilds the current one by hand.
 | `Enter` (in send box) | Send message to claude (via the launcher) |
 | `Shift+Enter` (in send box) | Insert a newline without sending |
 | `Ctrl+.` | Interrupt claude (send Esc; cancels the current turn) |
+| `Alt+S` / `Alt+I` | Send composed message / interrupt current turn |
 | `Alt+F4` | Quit |
 
 In the **Open conversation** dialog:
@@ -207,10 +277,10 @@ the file is re-polled and the page is rebuilt.
 
 ## Threading
 
-Reads use two background workers: one for the visible transcript and one
-for background tabs, directory scans and session metadata. Writes use a
-third worker, so sending a message never waits behind a transcript read.
-FTP control connections are private to each worker thread.
+Reads use three workers: one for the visible transcript, one for background
+tabs and session metadata, and one for user-initiated conversation-index
+scans. Writes use another worker, so sending a message never waits behind a
+transcript read. FTP/SFTP connections are private to each worker thread.
 
 - The active tab checks for appended records every 200 ms. Background tabs
   check at most once every 2 seconds. A queued background read is promoted
@@ -237,9 +307,24 @@ transcripts also log their read offset, byte count and read duration.
 Render timings measure Python rendering and WebView update calls, not the
 browser's eventual paint or a screen reader's response.
 
-## F5 / Ctrl+R is *not* fire-and-forget
+## Opening conversations
 
-Pressing `F5` (or `Ctrl+R`) submits a refresh job to the IO worker thread
+The Open dialogs reuse recent index snapshots and directory listings for
+5 seconds. Reopening shows cached rows immediately; older cached rows stay
+usable while a new scan runs. Refresh bypasses the directory cache. Index
+scans run independently of transcript polling and session-status scans.
+
+Initial scans use session names already polled by the main window and do
+not wait for transcript preview reads. Optional conversation-name and Codex
+working-directory previews are filled after the list is visible, preserving
+the selection and focus. Show all also resolves older Claude session names
+in the background. The first scan still needs to list project/day directories;
+its duration depends on their number and network latency. `Index scan` timing
+entries in the log distinguish scanning time from queue delay.
+
+## Ctrl+R refresh waits for the read to finish
+
+Pressing `Ctrl+R` submits a refresh job to the IO worker thread
 and then waits for the worker to actually complete the read. The status
 bar narrates each phase:
 
@@ -507,7 +592,7 @@ Any of:
 - **File -> Change Codex folder...** (remembered as `codex_dir` in
   `%USERPROFILE%\.clacogui_config.json`);
 - `python clacogui.py <claude-spec> --codex <codex-spec>`;
-- with `run.cmd` and the WSL FTP setup, `setx CLACOGUI_WSL_CODEX_HOME
+- with `run.cmd` and the FTP setup, `setx CLACOGUI_CODEX_DIR
   /home/me/.codex` and the Codex home is served by the same FTP server.
 
 Then **File -> Open Codex conversation...** (`Ctrl+Shift+O`).  The
@@ -595,12 +680,18 @@ What changes compared to Claude:
   dialog.
 - `fs.py` &mdash; backend abstraction: `LocalBackend`, `FtpBackend`,
   `make_backend()`; read/write/list/delete/mkdir.
+- `sftp_backend.py` &mdash; SSH key authentication, verified host keys,
+  per-worker connections, and incremental SFTP reads and atomic writes.
 - `models.py` &mdash; JSONL parsing, session-name lookup. All IO goes
   through an `FsBackend`.
 - `codex_models.py` &mdash; the same for Codex rollouts, thread names and
   Codex launcher state.
 - `render.py` &mdash; Markdown -> HTML, code-block -> `<textarea>`
   rewriting, JS keystroke shim.
+- `shortcuts.py` and `KEYBOARD_SHORTCUTS.md` &mdash; shared native/WebView
+  shortcut registry and complete shortcut inventory.
+- `conversation_index.py` &mdash; open-dialog snapshots, directory listings
+  and deferred preview caches.
 - `clacogui_agent.py` &mdash; hook + installer; ships standalone.
 - `clacogui_launcher.py` &mdash; transparent PTY launcher for
   claude; installed by `clacogui_agent.py install`.
@@ -610,4 +701,6 @@ What changes compared to Claude:
   `clacogui_agent.py install` under the venv.
 - `run.cmd` &mdash; Windows launcher: creates `.venv`, refreshes deps when
   `requirements.txt` changes, defaults the spec to the dev FTP URL.
+- `launch_hidden.vbs` &mdash; shared hidden-launch implementation for the
+  private FTP and SFTP profiles.
 - `requirements.txt`

@@ -408,13 +408,13 @@ def cmd_install(argv: list[str]) -> None:
         description=(
             "Install the clacogui hook into a Claude Code config directory. "
             "Target may be a local path (incl. an SMB-mapped drive) or an "
-            "ftp:// URL."
+            "ftp:// or sftp:// URL."
         ),
     )
     p.add_argument(
         "target",
         nargs="?",
-        help="Local path or ftp:// URL to the .claude directory",
+        help="Local path or FTP/SFTP URL to the .claude directory",
     )
     p.add_argument(
         "--remote-script",
@@ -450,7 +450,7 @@ def cmd_install(argv: list[str]) -> None:
         return
 
     target = args.target or _ask(
-        "Path or ftp:// URL to your Claude Code .claude folder",
+        "Path or FTP/SFTP URL to your Claude Code .claude folder",
         default=None,
         require=True,
     )
@@ -470,10 +470,70 @@ def cmd_install(argv: list[str]) -> None:
             f"unavailable until you reinstall from a complete bundle."
         )
 
-    if target.lower().startswith(("ftp://", "ftps://")):
+    if target.lower().startswith("sftp://"):
+        _install_sftp(target, src_bytes, launcher_bytes, args)
+    elif target.lower().startswith(("ftp://", "ftps://")):
         _install_ftp(target, src_bytes, launcher_bytes, args)
     else:
         _install_local(target, src_bytes, launcher_bytes, args)
+
+
+def _install_sftp(url, agent_bytes, launcher_bytes, args, *, codex=False, remote_script=None, cmd=None):
+    """Install through the GUI's SFTP backend, preserving existing settings."""
+    import posixpath
+    from fs import make_backend
+
+    backend = make_backend(url)
+    root = backend.root
+    # --remote-script may live outside the selected provider directory.
+    backend.root = "/"
+    try:
+        remote_script = remote_script or args.remote_script or _ask(
+            "Absolute path on the remote host for the hook script",
+            default=posixpath.join(root, "clacogui_agent.py"),
+            require=True, silent=args.yes,
+        )
+        if not remote_script.startswith("/"):
+            sys.exit("clacogui_agent: SFTP requires an absolute remote script path")
+        if cmd is None:
+            interpreter = args.python or _ask(
+                "Python interpreter on the remote host", default="python3",
+                require=True, silent=args.yes,
+            )
+            cmd = f"{interpreter} {remote_script} hook" + (" --codex" if codex else "")
+        print(f"[clacogui_agent] SFTP install into {backend.host}:{backend.port}{root}")
+        backend.write_bytes(remote_script, agent_bytes)
+        if launcher_bytes is not None:
+            name = CODEX_LAUNCHER_NAME if codex else LAUNCHER_NAME
+            backend.write_bytes(posixpath.join(posixpath.dirname(remote_script), name), launcher_bytes)
+        directories = [NOTIFICATIONS_DIR, REQUESTS_DIR, RESPONSES_DIR, OUTGOING_DIR]
+        if codex:
+            directories.append(CODEX_STATE_DIR)
+        for directory in directories:
+            backend.mkdir(posixpath.join(root, directory), exist_ok=True)
+        settings_path = posixpath.join(root, "config.toml" if codex else "settings.json")
+        try:
+            text = backend.read_text(settings_path)
+        except FileNotFoundError:
+            text = ""
+        if codex:
+            merged = _merge_codex_config(text, cmd)
+        else:
+            try:
+                settings = json.loads(text) if text else {}
+                if not isinstance(settings, dict):
+                    raise ValueError("expected a JSON object")
+            except ValueError as error:
+                if not (args.yes or _confirm(f"Existing {settings_path} is unreadable JSON ({error}). Overwrite?")):
+                    sys.exit(1)
+                settings = {}
+            merged = json.dumps(_merge_hook_config(settings, cmd), indent=2)
+        backend.write_text(settings_path, merged)
+        print(f"[clacogui_agent] Updated {settings_path}")
+        if not codex:
+            print(f"Done. The hook command Claude will run is:\n    {cmd}")
+    finally:
+        backend.close()
 
 
 def _install_local(
@@ -862,7 +922,7 @@ def _foreign_tables(block_body: str) -> str:
 
 def _cmd_install_codex(args) -> None:
     target = args.target or _ask(
-        "Path or ftp:// URL to your Codex home (.codex) folder",
+        "Path or FTP/SFTP URL to your Codex home (.codex) folder",
         default=None,
         require=True,
     )
@@ -876,7 +936,8 @@ def _cmd_install_codex(args) -> None:
             f"clacogui_agent.py; install from a complete bundle."
         )
     is_ftp = target.lower().startswith(("ftp://", "ftps://"))
-    if is_ftp:
+    is_sftp = target.lower().startswith("sftp://")
+    if is_ftp or is_sftp:
         from urllib.parse import unquote, urlparse
 
         root = unquote(urlparse(target).path or "/").rstrip("/") or "/"
@@ -897,7 +958,10 @@ def _cmd_install_codex(args) -> None:
     )
     cmd = f"{interpreter} {remote_script} hook --codex"
     dirs = (NOTIFICATIONS_DIR, REQUESTS_DIR, RESPONSES_DIR, OUTGOING_DIR, CODEX_STATE_DIR)
-    if is_ftp:
+    if is_sftp:
+        _install_sftp(target, agent_bytes, launcher_bytes, args, codex=True,
+                      remote_script=remote_script, cmd=cmd)
+    elif is_ftp:
         _install_codex_ftp(target, remote_script, agent_bytes, launcher_bytes, dirs, cmd)
     else:
         _install_codex_local(target, remote_script, agent_bytes, launcher_bytes, dirs, cmd)

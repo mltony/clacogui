@@ -9,13 +9,16 @@ form controls so they expose as multi-line edit boxes to screen readers in
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
+from dataclasses import asdict
 from typing import Tuple
 
 import markdown as md_lib
 
 from models import Turn
+from shortcuts import SHORTCUTS
 
 log = logging.getLogger(__name__)
 
@@ -25,8 +28,7 @@ _PLACEHOLDER_FMT = "\x00CLACOCODEBLOCK{}\x00"
 
 
 # Injected into every page so that keystrokes the WebView would otherwise
-# swallow (F2, F4, F5, F6, Ctrl+Tab, Ctrl+1..9, Ctrl+O, Ctrl+W, Ctrl+R,
-# Ctrl+Shift+PgUp/Dn, Alt+<letter>) are forwarded to the wx side via a
+# swallow are matched against shortcuts.SHORTCUTS and forwarded via a
 # custom-scheme navigation.  ``ConversationPanel`` listens for
 # EVT_WEBVIEW_NAVIGATING with this prefix, vetoes the navigation, and
 # dispatches the action.
@@ -63,83 +65,24 @@ _KEY_FORWARDER_JS = """
     if (isBlocked(e.target)) { e.preventDefault(); }
   }, true);
 
+  var shortcuts = __CLACOGUI_SHORTCUTS__;
   document.addEventListener('keydown', function(e) {
-    var k = e.key;
-    if (k === 'F2') {
-      e.preventDefault(); e.stopPropagation();
-      act('focus-list');
-      return;
-    }
-    if (k === 'F4') {
-      e.preventDefault(); e.stopPropagation();
-      act('focus-html');
-      return;
-    }
-    if (k === 'F5') {
-      e.preventDefault(); e.stopPropagation();
-      act('focus-send');
-      return;
-    }
-    if (k === 'F6') {
-      e.preventDefault(); e.stopPropagation();
-      act('toggle-pane');
-      return;
-    }
-    // Alt+<letter> -- give it back to wx so the menu bar's mnemonic
-    // (Alt+F = File, Alt+V = View, ...) actually triggers.  Without this
-    // the WebView swallows the keystroke before the menubar sees it.
-    if (e.altKey && !e.ctrlKey && !e.metaKey) {
-      var ak = (k || '').toLowerCase();
-      if (ak.length === 1 && ak >= 'a' && ak <= 'z') {
-        e.preventDefault(); e.stopPropagation();
-        act('alt-key/' + ak);
+    if (e.metaKey || e.isComposing) return;
+    var key = (e.key || '').toLowerCase();
+    for (var i = 0; i < shortcuts.length; ++i) {
+      var s = shortcuts[i];
+      if (key === s.key && !!e.ctrlKey === s.ctrl &&
+          !!e.shiftKey === s.shift && !!e.altKey === s.alt) {
+        e.preventDefault();
+        e.stopPropagation();
+        act(s.action);
         return;
-      }
-    }
-    if (e.ctrlKey && !e.altKey) {
-      if (k === 'Tab') {
-        e.preventDefault(); e.stopPropagation();
-        act(e.shiftKey ? 'prev-tab' : 'next-tab');
-        return;
-      }
-      if (e.shiftKey) {
-        // Ctrl+Shift+PageUp/PageDown -- move the current tab without
-        // wrapping.  wx side decides whether the move is legal.
-        if (k === 'PageUp') {
-          e.preventDefault(); e.stopPropagation();
-          act('move-tab-prev');
-          return;
-        }
-        if (k === 'PageDown') {
-          e.preventDefault(); e.stopPropagation();
-          act('move-tab-next');
-          return;
-        }
-      } else {
-        if (/^[1-9]$/.test(k)) {
-          e.preventDefault(); e.stopPropagation();
-          act('tab-' + k);
-          return;
-        }
-        // Ctrl+. -- "Interrupt claude".  e.key is literally '.'
-        // on every layout I checked; keep the explicit string so we
-        // don't trip on non-US layouts where keyCode==190 isn't
-        // the period.
-        if (k === '.') {
-          e.preventDefault(); e.stopPropagation();
-          act('interrupt-claude');
-          return;
-        }
-        var lower = (k || '').toLowerCase();
-        if (lower === 'o') { e.preventDefault(); e.stopPropagation(); act('open'); return; }
-        if (lower === 'w') { e.preventDefault(); e.stopPropagation(); act('close-tab'); return; }
-        if (lower === 'r') { e.preventDefault(); e.stopPropagation(); act('reload'); return; }
       }
     }
   }, true);
 })();
 </script>
-"""
+""".replace("__CLACOGUI_SHORTCUTS__", json.dumps([asdict(s) for s in SHORTCUTS]))
 
 
 _PAGE_CSS = """

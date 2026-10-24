@@ -15,6 +15,7 @@ shortcuts.
 from __future__ import annotations
 
 import atexit
+import getpass
 import hashlib
 import json
 import logging
@@ -38,10 +39,12 @@ except ImportError:  # not on Windows; we'll fall back to wx.Bell
     winsound = None  # type: ignore[assignment]
 
 import models
+import conversation_index
 import io_jobs
 import metadata_cache
 import transcript_cache
 import webview_health
+import shortcuts
 from fs import FsBackend, FtpBackend, make_backend
 
 # Directory names mirrored from clacogui_agent.py.  Kept inline (rather than
@@ -487,7 +490,7 @@ def _shutdown_io_thread() -> None:
 def submit_io(
     fn: Callable,
     on_done: Callable[[object, Optional[BaseException]], None],
-    *, foreground: bool = False, label: Optional[str] = None,
+    *, foreground: bool = False, index: bool = False, label: Optional[str] = None,
 ) -> io_jobs.ReadJob:
     """Read off the UI thread and deliver results through wx.CallAfter.
 
@@ -495,7 +498,7 @@ def submit_io(
     while waiting; work that has already started is never duplicated.
     Callbacks must check that their window still exists.
     """
-    return _read_workers.submit(fn, on_done, foreground=foreground, label=label)
+    return _read_workers.submit(fn, on_done, foreground=foreground, index=index, label=label)
 
 
 def submit_io_write(
@@ -549,13 +552,15 @@ def save_config(cfg: dict) -> None:
 def folder_key(backend: Optional[FsBackend]) -> str:
     """Identity of a folder for remembering its open tabs.
 
-    FTP leaves out the host: ``run.cmd`` points at WSL, whose address
-    changes on every boot.
+    FTP keeps the legacy host-independent key so existing saved tabs still
+    restore. Folder locks use the full endpoint instead (see ``_lock_key``).
     """
     if backend is None:
         return ""
     if isinstance(backend, FtpBackend):
         return f"ftp://{backend.user}@:{backend.port}{backend.root or '/'}"
+    if not _looks_local(backend.display_root()):
+        return backend.display_root()
     return os.path.normcase(os.path.abspath(backend.display_root()))
 
 
@@ -572,7 +577,7 @@ def submit_io_with_retry(
     fn: Callable,
     on_success: Callable[[object], None],
     on_give_up: Optional[Callable[[BaseException], None]] = None,
-    *, foreground: bool = False,
+    *, foreground: bool = False, index: bool = False,
 ) -> io_jobs.ReadJob:
     """Async ``submit_io`` that pops a Retry/Quit dialog on ``OSError``.
 
@@ -637,7 +642,7 @@ def submit_io_with_retry(
         if choice == wx.ID_YES:
             submit_io_with_retry(
                 parent, op_label, fn, on_success, on_give_up,
-                foreground=foreground,
+                foreground=foreground, index=index,
             )
             return
 
@@ -648,7 +653,7 @@ def submit_io_with_retry(
             if top is not None:
                 top.Close(force=True)
 
-    return submit_io(fn, callback, foreground=foreground, label=op_label)
+    return submit_io(fn, callback, foreground=foreground, index=index, label=op_label)
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +677,7 @@ class OpenConversationDialog(wx.Dialog):
         parent: wx.Window,
         backend: FsBackend,
         cached_active_sids: Optional[set[str]] = None,
+        cached_names: Optional[dict[str, str]] = None,
     ) -> None:
         super().__init__(
             parent,
@@ -683,6 +689,12 @@ class OpenConversationDialog(wx.Dialog):
         self._rows: list[_Row] = []
         self._all_rows: list[_Row] = []
         self._active_sids: set[str] = cached_active_sids or set()
+        self._have_active_sids = cached_active_sids is not None
+        self._cached_names = dict(cached_names or {})
+        self._force_scan = False
+        self._defer_previews = False
+        self._resolving_names = False
+        self._list_populated = False
         self._sort_mode = self.SORT_TIMESTAMP
         self._loading = False
         self._pulse_timer: Optional[wx.Timer] = None
@@ -742,7 +754,7 @@ class OpenConversationDialog(wx.Dialog):
         # Bindings
         self._btn_sort_time.Bind(wx.EVT_BUTTON, lambda _e: self._sort(self.SORT_TIMESTAMP))
         self._btn_sort_name.Bind(wx.EVT_BUTTON, lambda _e: self._sort(self.SORT_NAME))
-        self._btn_refresh.Bind(wx.EVT_BUTTON, lambda _e: self._populate())
+        self._btn_refresh.Bind(wx.EVT_BUTTON, lambda _e: self._populate(force=True))
         self._chk_show_all.Bind(wx.EVT_CHECKBOX, lambda _e: self._apply_filter())
         self._list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, lambda _e: self.EndModal(wx.ID_OK))
         self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
@@ -758,7 +770,7 @@ class OpenConversationDialog(wx.Dialog):
         event.Skip()
 
     def _on_ok(self, event: wx.CommandEvent) -> None:
-        if self._loading:
+        if self._loading and not self._rows:
             wx.MessageBox(
                 "Still scanning conversations, please wait...",
                 "Loading",
@@ -781,7 +793,10 @@ class OpenConversationDialog(wx.Dialog):
 
     # -- Data ---------------------------------------------------------------
 
-    def _populate(self) -> None:
+    def _cache_scope(self):
+        return "claude"
+
+    def _populate(self, force: bool = False) -> None:
         """Kick off a background scan of the conversation index.
 
         Runs sessions -> projects -> filename-based summaries on the IO
@@ -791,57 +806,53 @@ class OpenConversationDialog(wx.Dialog):
         """
         if self._loading:
             return
+        self._force_scan = force
+        cached = conversation_index.snapshot(self.backend, self._cache_scope())
+        if cached is not None:
+            result, age = cached
+            rows, active = result
+            for row in rows:
+                if row.info.session_id in self._cached_names:
+                    row.info.name = self._cached_names[row.info.session_id]
+            self._defer_previews = force or age >= conversation_index.FRESH_SEC
+            self._on_populate_done((rows, self._active_sids if self._have_active_sids else active))
+            self._defer_previews = False
+            if not force and age < conversation_index.FRESH_SEC:
+                return
         self._loading = True
         self._set_loading(True)
-
         backend = self.backend
-
         cached_sids = self._active_sids
+        scope = self._cache_scope()
 
         def work() -> tuple[list[_Row], set[str]]:
-            return self._scan(backend, cached_sids)
+            started = time.monotonic()
+            result = self._scan(backend, cached_sids)
+            conversation_index.remember(backend, scope, result)
+            log.info("Index scan: %s rows=%d %.1fms", scope, len(result[0]),
+                     (time.monotonic() - started) * 1000)
+            return result
 
         submit_io_with_retry(
-            self,
-            "loading conversation index",
-            work,
-            self._on_populate_done,
-            on_give_up=lambda _exc: self._on_populate_aborted(),
+            self, "loading conversation index", work, self._on_populate_done,
+            on_give_up=lambda _exc: self._on_populate_aborted(), index=True,
         )
 
     def _scan(
         self, backend: FsBackend, cached_sids: set[str]
     ) -> tuple[list[_Row], set[str]]:
         """Build the dialog rows.  Runs on the IO worker thread."""
-        session_names = load_session_names(backend)
-        rows: list[_Row] = []
-        for rel_path, project_dir, mtime, _size in iter_conversation_files(backend):
+        if self._have_active_sids:
+            active_sids, session_names = set(cached_sids), self._cached_names
+        else:
+            status_map, session_names = _read_claude_session_state(backend)
+            active_sids = set(status_map)
+        rows = []
+        listing = conversation_index.ListingView(backend, force=self._force_scan)
+        for rel_path, project_dir, mtime, _size in iter_conversation_files(listing):
             info = summarize_conversation(rel_path, session_names, project_dir, mtime)
             rows.append(_Row(info))
-        # Reuse cached active_sids if available (from MainFrame's
-        # 1s poll), saving an FTP round-trip.
-        if cached_sids:
-            active_sids = cached_sids
-        else:
-            status_map, _ = _read_claude_session_state(backend)
-            active_sids = set(status_map.keys())
-        # Head-read for unnamed conversations: only those that are
-        # active (shown in the default view).  Inactive unnamed ones
-        # get their names lazily if the user checks "Show all".
-        unnamed = [
-            r for r in rows
-            if r.info.name == r.info.session_id
-            and r.info.session_id in active_sids
-        ]
-        unnamed.sort(key=lambda r: -r.info.mtime)
-        for r in unnamed[:20]:
-            try:
-                head = backend.read_text_head(r.info.rel_path, 4096)
-                name = extract_name_from_head(head)
-                if name:
-                    r.info.name = name
-            except OSError:
-                pass
+        # Transcript preview reads happen after the rows are visible.
         return rows, active_sids
 
     def _on_populate_done(self, result: tuple[list[_Row], set[str]]) -> None:
@@ -855,16 +866,18 @@ class OpenConversationDialog(wx.Dialog):
         self._apply_filter()
 
     def _apply_filter(self) -> None:
+        selected = self.selected()
+        selected_rel = selected.rel_path if selected else None
         show_all = self._chk_show_all.IsChecked()
         if show_all:
             self._rows = list(self._all_rows)
-            self._resolve_unnamed_lazy()
         else:
             self._rows = [
                 r for r in self._all_rows
                 if r.info.session_id in self._active_sids
             ]
-        self._sort(self._sort_mode)
+        self._sort(self._sort_mode, selected_rel=selected_rel)
+        self._resolve_unnamed_lazy()
         total = len(self._all_rows)
         shown = len(self._rows)
         if shown == total:
@@ -875,38 +888,47 @@ class OpenConversationDialog(wx.Dialog):
             )
 
     def _resolve_unnamed_lazy(self) -> None:
-        """Background-resolve names for unnamed rows (triggered by Show All)."""
-        unnamed = [
-            r for r in self._all_rows
-            if r.info.name == r.info.session_id
-        ]
+        """Fill optional names after displaying usable rows."""
+        if self._resolving_names or self._defer_previews:
+            return
+        unnamed = [r for r in self._rows if r.info.name == r.info.session_id]
         if not unnamed:
             return
         unnamed.sort(key=lambda r: -r.info.mtime)
         to_resolve = unnamed[:30]
         backend = self.backend
+        show_all = self._chk_show_all.IsChecked()
+        rows_for_names = [(r.info.rel_path, r.info.session_id) for r in self._all_rows]
+        self._resolving_names = True
 
         def work():
-            resolved = {}
-            for r in to_resolve:
-                try:
-                    head = backend.read_text_head(r.info.rel_path, 4096)
-                    name = extract_name_from_head(head)
-                    if name:
-                        resolved[r.info.rel_path] = name
-                except OSError:
-                    pass
+            names = load_session_names(backend) if show_all else {}
+            resolved = {rel: names[sid] for rel, sid in rows_for_names if sid in names}
+            for row in to_resolve:
+                name = names.get(row.info.session_id)
+                if not name:
+                    try:
+                        name = extract_name_from_head(conversation_index.preview(
+                            backend, row.info.rel_path, row.info.mtime))
+                    except OSError:
+                        continue
+                if name:
+                    resolved[row.info.rel_path] = name
             return resolved
 
         def callback(result, exc):
-            if not self or exc is not None or not result:
+            if not self:
                 return
-            for r in self._all_rows:
-                if r.info.rel_path in result:
-                    r.info.name = result[r.info.rel_path]
+            self._resolving_names = False
+            if exc is not None or not result:
+                return
+            for row in self._all_rows:
+                if row.info.rel_path in result:
+                    row.info.name = result[row.info.rel_path]
+            conversation_index.remember(backend, self._cache_scope(), (self._all_rows, self._active_sids), preserve_age=True)
             self._sort(self._sort_mode)
 
-        submit_io(work, callback)
+        submit_io(work, callback, index=True, label="conversation name previews")
 
     def _on_populate_aborted(self) -> None:
         if not self:
@@ -917,10 +939,14 @@ class OpenConversationDialog(wx.Dialog):
 
     def _set_loading(self, loading: bool) -> None:
         for btn in (self._btn_sort_time, self._btn_sort_name, self._btn_refresh):
-            btn.Enable(not loading)
+            btn.Enable(not loading or (bool(self._rows) and btn is not self._btn_refresh))
         ok = self.FindWindow(wx.ID_OK)
         if ok is not None:
-            ok.Enable(not loading)
+            ok.Enable(not loading or bool(self._rows))
+        self._chk_show_all.Enable(not loading)
+        if loading and self._rows:
+            self._status_label.SetLabel("Refreshing...")
+            return
         if loading:
             self._list.DeleteAllItems()
             self._list.InsertItem(0, "Scanning conversations, please wait...")
@@ -941,25 +967,36 @@ class OpenConversationDialog(wx.Dialog):
         else:
             self._status_label.SetLabel(cur + ".")
 
-    def _sort(self, mode: int) -> None:
+    def _sort(self, mode: int, selected_rel=None) -> None:
+        if selected_rel is None:
+            selected = self.selected()
+            selected_rel = selected.rel_path if selected else None
         self._sort_mode = mode
         if mode == self.SORT_NAME:
             self._rows.sort(key=lambda r: (r.info.display_name().lower(), -r.info.mtime))
         else:
             self._rows.sort(key=lambda r: -r.info.mtime)
-        self._refresh_list()
+        self._refresh_list(selected_rel)
 
-    def _refresh_list(self) -> None:
-        self._list.DeleteAllItems()
-        for row in self._rows:
-            idx = self._list.InsertItem(self._list.GetItemCount(), row.info.display_name())
-            self._list.SetItem(idx, 1, format_timestamp(row.info.mtime))
-            self._list.SetItem(idx, 2, row.info.project_dir)
-            self._list.SetItem(idx, 3, os.path.basename(row.info.rel_path))
-        if self._list.GetItemCount() > 0:
-            self._list.Select(0)
-            self._list.Focus(0)
-            self._list.SetFocus()
+    def _refresh_list(self, selected_rel=None) -> None:
+        self._list.Freeze()
+        try:
+            self._list.DeleteAllItems()
+            for row in self._rows:
+                idx = self._list.InsertItem(self._list.GetItemCount(), row.info.display_name())
+                self._list.SetItem(idx, 1, format_timestamp(row.info.mtime))
+                self._list.SetItem(idx, 2, row.info.project_dir)
+                self._list.SetItem(idx, 3, os.path.basename(row.info.rel_path))
+            if self._list.GetItemCount() > 0:
+                index = next((i for i, row in enumerate(self._rows)
+                              if row.info.rel_path == selected_rel), 0)
+                self._list.Select(index)
+                self._list.Focus(index)
+                if not self._list_populated:
+                    self._list.SetFocus()
+                    self._list_populated = True
+        finally:
+            self._list.Thaw()
 
     def selected(self) -> Optional[ConversationInfo]:
         idx = self._list.GetFirstSelected()
@@ -984,10 +1021,14 @@ class OpenCodexConversationDialog(OpenConversationDialog):
         parent: wx.Window,
         backend: FsBackend,
         cached_active_sids: Optional[set[str]] = None,
+        cached_names: Optional[dict[str, str]] = None,
     ) -> None:
         self._day_limit: Optional[int] = codex_models.RECENT_DAY_DIRS
-        super().__init__(parent, backend, cached_active_sids)
+        super().__init__(parent, backend, cached_active_sids, cached_names)
         self.SetTitle("Open Codex conversation")
+
+    def _cache_scope(self):
+        return f"codex-{self._day_limit}"
 
     def _index_root(self) -> str:
         return self.backend.display_path(codex_models.SESSIONS_DIR)
@@ -995,12 +1036,12 @@ class OpenCodexConversationDialog(OpenConversationDialog):
     def _scan(
         self, backend: FsBackend, cached_sids: set[str]
     ) -> tuple[list[_Row], set[str]]:
-        names = codex_models.load_session_names(backend)
+        names = self._cached_names or codex_models.load_session_names(backend)
         states = codex_models.read_launcher_states(backend)
         rows: list[_Row] = []
         seen: set[str] = set()
         for rel, _day, mtime, _size in codex_models.iter_conversation_files(
-            backend, self._day_limit
+            conversation_index.ListingView(backend, force=self._force_scan), self._day_limit
         ):
             rows.append(_Row(codex_models.summarize_conversation(rel, names, mtime)))
             seen.add(rel)
@@ -1021,16 +1062,6 @@ class OpenCodexConversationDialog(OpenConversationDialog):
             for r in rows
             if r.info.session_id and r.info.mtime and now - r.info.mtime < self.RECENT_ACTIVE_SEC
         }
-        shown = sorted(
-            (r for r in rows if r.info.session_id in active), key=lambda r: -r.info.mtime
-        )
-        for r in shown[:20]:
-            try:
-                r.info.project_dir = codex_models.cwd_from_head(
-                    backend.read_text_head(r.info.rel_path, 4096)
-                )
-            except OSError:
-                pass
         return rows, active
 
     def _apply_filter(self) -> None:
@@ -1041,8 +1072,34 @@ class OpenCodexConversationDialog(OpenConversationDialog):
         super()._apply_filter()
 
     def _resolve_unnamed_lazy(self) -> None:
-        # Codex names come from session_index.jsonl, read during the scan.
-        return
+        # CWD previews are optional and must not delay displaying the list.
+        if self._resolving_names or self._defer_previews:
+            return
+        rows = [r for r in self._rows if not r.info.project_dir][:20]
+        if not rows:
+            return
+        self._resolving_names = True
+        backend = self.backend
+        def work():
+            result = {}
+            for row in rows:
+                try:
+                    result[row.info.rel_path] = codex_models.cwd_from_head(
+                        conversation_index.preview(backend, row.info.rel_path, row.info.mtime))
+                except OSError:
+                    pass
+            return result
+        def callback(result, exc):
+            if not self:
+                return
+            self._resolving_names = False
+            if exc is None and result:
+                for row in self._all_rows:
+                    if row.info.rel_path in result:
+                        row.info.project_dir = result[row.info.rel_path]
+                conversation_index.remember(backend, self._cache_scope(), (self._all_rows, self._active_sids), preserve_age=True)
+                self._sort(self._sort_mode)
+        submit_io(work, callback, index=True, label="Codex directory previews")
 
 
 # ---------------------------------------------------------------------------
@@ -1683,7 +1740,8 @@ class ConversationPanel(wx.Panel):
             view.SetFocus()
 
     def _on_keydown(self, event: wx.KeyEvent) -> None:
-        if event.GetKeyCode() == wx.WXK_F6:
+        if (event.GetKeyCode() == wx.WXK_F6
+                and not event.ControlDown() and not event.AltDown() and not event.MetaDown()):
             self.toggle_pane(reverse=event.ShiftDown())
             return
         event.Skip()
@@ -2281,47 +2339,18 @@ class ConversationPanel(wx.Panel):
                 log.warning("Could not open external link %s", url, exc_info=True)
 
     def _handle_webview_action(self, action: str) -> None:
-        if action == "toggle-pane":
-            self.toggle_pane()
-            return
         frame = self.GetTopLevelParent()
         if not isinstance(frame, MainFrame):
             return
-        if action == "next-tab":
-            frame._switch_tab(+1)
-        elif action == "prev-tab":
-            frame._switch_tab(-1)
-        elif action == "move-tab-prev":
-            frame._move_tab(-1)
-        elif action == "move-tab-next":
-            frame._move_tab(+1)
-        elif action == "focus-list":
-            frame._focus_pane(False)
-        elif action == "focus-html":
-            frame._focus_pane(True)
-        elif action == "focus-send":
-            frame._focus_send_box()
-        elif action.startswith("tab-"):
-            try:
-                n = int(action[4:]) - 1
-            except ValueError:
-                return
-            frame._goto_tab(n)
-        elif action.startswith("alt-key/"):
-            letter = action[len("alt-key/"):]
-            frame._activate_menu_mnemonic(letter)
-        elif action == "open":
-            frame._on_open(None)
-        elif action == "close-tab":
-            frame._on_close_tab(None)
-        elif action == "reload":
-            frame._on_reload(None)
-        elif action == "interrupt-claude":
-            frame._on_interrupt_claude(None)
-        else:
-            log.debug("Unknown WebView action: %r", action)
+        if action.startswith("alt-key/"):
+            frame._activate_menu_mnemonic(action[len("alt-key/"):])
+            return
+        command_id = frame._shortcut_ids().get(action)
+        if command_id is not None:
+            # Dispatch after the navigation event is vetoed. In particular,
+            # Alt+F4 must not destroy the WebView inside its own callback.
+            wx.PostEvent(frame, wx.CommandEvent(wx.EVT_MENU.typeId, command_id))
 
-    # -- Internals ----------------------------------------------------------
 
     def _notify_name_change(self) -> None:
         # The MainFrame listens for this and updates the notebook tab label.
@@ -3280,6 +3309,8 @@ ID_RELOAD = wx.NewIdRef()
 ID_FOCUS_LIST = wx.NewIdRef()
 ID_FOCUS_HTML = wx.NewIdRef()
 ID_FOCUS_SEND = wx.NewIdRef()
+ID_TOGGLE_PANE = wx.NewIdRef()
+ID_SEND_MESSAGE = wx.NewIdRef()
 ID_INTERRUPT_CLAUDE = wx.NewIdRef()
 ID_OPEN_CODEX = wx.NewIdRef()
 ID_CHANGE_CODEX_DIR = wx.NewIdRef()
@@ -3518,6 +3549,8 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._focus_send_box(), id=ID_FOCUS_SEND)
         self.Bind(wx.EVT_MENU, self._on_interrupt_claude, id=ID_INTERRUPT_CLAUDE)
         self.Bind(wx.EVT_MENU, self._on_rebuild_webview, id=ID_REBUILD_WEBVIEW)
+        self.Bind(wx.EVT_MENU, lambda _e: self._toggle_pane(), id=ID_TOGGLE_PANE)
+        self.Bind(wx.EVT_MENU, lambda _e: self._send_current(), id=ID_SEND_MESSAGE)
         for i, tid in enumerate(_TAB_IDS):
             self.Bind(wx.EVT_MENU, lambda _e, n=i: self._goto_tab(n), id=tid)
 
@@ -3568,36 +3601,35 @@ class MainFrame(wx.Frame):
         self._status_revert_timer: Optional[wx.Timer] = None
         self._base_title = "clacogui - Claude Code conversation viewer"
 
+    def _shortcut_ids(self):
+        actions = {
+            "open": ID_OPEN, "open-codex": ID_OPEN_CODEX,
+            "close-tab": ID_CLOSE_TAB, "reload": ID_RELOAD,
+            "rebuild-webview": ID_REBUILD_WEBVIEW,
+            "next-tab": ID_NEXT_TAB, "prev-tab": ID_PREV_TAB,
+            "move-tab-prev": ID_MOVE_TAB_PREV, "move-tab-next": ID_MOVE_TAB_NEXT,
+            "focus-list": ID_FOCUS_LIST, "focus-html": ID_FOCUS_HTML,
+            "focus-send": ID_FOCUS_SEND, "toggle-pane": ID_TOGGLE_PANE,
+            "quit": wx.ID_EXIT, "interrupt-claude": ID_INTERRUPT_CLAUDE,
+            "send": ID_SEND_MESSAGE,
+        }
+        actions.update({f"tab-{i + 1}": tid for i, tid in enumerate(_TAB_IDS)})
+        return actions
+
     def _build_accelerators(self) -> None:
-        accels = [
-            (wx.ACCEL_CTRL, ord("O"), ID_OPEN),
-            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("O"), ID_OPEN_CODEX),
-            (wx.ACCEL_CTRL, ord("W"), ID_CLOSE_TAB),
-            (wx.ACCEL_CTRL, wx.WXK_F4, ID_CLOSE_TAB),
-            (wx.ACCEL_CTRL, ord("R"), ID_RELOAD),
-            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("R"), ID_REBUILD_WEBVIEW),
-            (wx.ACCEL_CTRL, wx.WXK_TAB, ID_NEXT_TAB),
-            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_TAB, ID_PREV_TAB),
-            # Move-current-tab without wrapping.
-            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_PAGEUP, ID_MOVE_TAB_PREV),
-            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_PAGEDOWN, ID_MOVE_TAB_NEXT),
-            # Pane-jump function keys (per user request).  F5 used to be
-            # Refresh; that's now Ctrl+R-only.
-            (wx.ACCEL_NORMAL, wx.WXK_F2, ID_FOCUS_LIST),
-            (wx.ACCEL_NORMAL, wx.WXK_F4, ID_FOCUS_HTML),
-            (wx.ACCEL_NORMAL, wx.WXK_F5, ID_FOCUS_SEND),
-            # F6 cycle kept for backward compat with previous builds.
-            (wx.ACCEL_NORMAL, wx.WXK_F6, ID_FOCUS_HTML),
-            (wx.ACCEL_SHIFT, wx.WXK_F6, ID_FOCUS_LIST),
-            (wx.ACCEL_ALT, wx.WXK_F4, wx.ID_EXIT),
-            # Interrupt claude (Esc-into-claude); ``ord('.')`` is the
-            # period key, so this is Ctrl+. on every layout where
-            # period is unmodified.
-            (wx.ACCEL_CTRL, ord('.'), ID_INTERRUPT_CLAUDE),
-        ]
-        for i, tid in enumerate(_TAB_IDS):
-            accels.append((wx.ACCEL_CTRL, ord(str(i + 1)), tid))
-        self.SetAcceleratorTable(wx.AcceleratorTable(accels))
+        self.SetAcceleratorTable(wx.AcceleratorTable(
+            shortcuts.wx_accelerators(wx, self._shortcut_ids())
+        ))
+
+    def _send_current(self):
+        panel = self._current_panel()
+        if panel is not None:
+            panel._on_send(None)
+
+    def _toggle_pane(self):
+        panel = self._current_panel()
+        if panel is not None:
+            panel.toggle_pane()
 
     # -- Helpers ------------------------------------------------------------
 
@@ -5237,7 +5269,8 @@ class MainFrame(wx.Frame):
 
         dlg = OpenConversationDialog(
             self, self.backend,
-            cached_active_sids=set(self._claude_status_map.keys()),
+            cached_active_sids=(set(self._claude_status_map) if self._agent_applied_gen else None),
+            cached_names=self._claude_session_names,
         )
         try:
             if dlg.ShowModal() != wx.ID_OK:
@@ -5289,7 +5322,8 @@ class MainFrame(wx.Frame):
                 return
         dlg = OpenCodexConversationDialog(
             self, self.codex_backend,
-            cached_active_sids=set(self._codex_status_map.keys()),
+            cached_active_sids=(set(self._codex_status_map) if self._codex_applied_gen else None),
+            cached_names=self._codex_session_names,
         )
         try:
             if dlg.ShowModal() != wx.ID_OK:
@@ -5428,18 +5462,19 @@ class MainFrame(wx.Frame):
 def _ask_for_backend_spec(
     parent: wx.Window, current: Optional[str], kind: str = PROVIDER_CLAUDE
 ) -> Optional[str]:
-    """Prompt for either a local/SMB path or an FTP URL."""
+    """Prompt for a local/SMB path or an FTP/SFTP URL."""
     if kind == PROVIDER_CODEX:
         label, leaf = "Codex", ".codex"
     else:
         label, leaf = "Claude Code", ".claude"
     msg = (
-        f"Enter the path to your {label} folder, or an FTP URL.\n\n"
+        f"Enter the path to your {label} folder, or an FTP/SFTP URL.\n\n"
         "Examples:\n"
         f"  X:\\{leaf}\n"
         f"  \\\\server\\share\\{leaf}\n"
         f"  /home/me/{leaf}\n"
-        f"  ftp://ftpuser:password@host:2121/home/me/{leaf}"
+        f"  ftp://ftpuser:password@host:2121/home/me/{leaf}\n"
+        f"  sftp://me@host:22/home/me/{leaf}"
     )
     dlg = wx.TextEntryDialog(
         parent,
@@ -5467,7 +5502,7 @@ class App(wx.App):
     Resolves the backend spec in this priority order:
         CLI argument > saved config > prompt the user.
 
-    A "spec" is either a local/SMB path or an ``ftp://`` URL.
+    A "spec" is a local/SMB path, an FTP URL, or an SFTP URL.
     """
 
     def __init__(
@@ -5571,7 +5606,7 @@ class App(wx.App):
 
 def _looks_local(spec: str) -> bool:
     lower = spec.strip().lower()
-    return not (lower.startswith("ftp://") or lower.startswith("ftps://"))
+    return not lower.startswith(("ftp://", "ftps://", "sftp://"))
 
 
 def _lock_key(spec: str) -> str:
@@ -5584,6 +5619,15 @@ def _lock_key(spec: str) -> str:
     if _looks_local(spec):
         return os.path.normcase(os.path.abspath(spec)).rstrip("\\/")
     u = urlparse(spec)
+    if u.scheme.lower() == "sftp":
+        from urllib.parse import quote
+        from posixpath import normpath
+        host = (u.hostname or "").lower()
+        if ":" in host:
+            host = f"[{host}]"
+        user = unquote(u.username) if u.username else getpass.getuser()
+        return (f"sftp://{quote(user, safe='')}@{host}:{u.port or 22}"
+                f"{normpath(unquote(u.path or '/'))}")
     host = u.netloc.rsplit("@", 1)[-1].lower()
     if ":" not in host:
         host += ":21"

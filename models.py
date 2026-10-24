@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
+import metadata_cache
 import transcript_cache
 from fs import FsBackend
 
@@ -137,10 +138,11 @@ def load_session_names(backend: FsBackend) -> dict[str, str]:
             continue
         rel = posixpath.join("sessions", entry.name)
         try:
-            text = backend.read_text(rel)
-            data = json.loads(text)
-        except (OSError, ValueError):
+            data = metadata_cache.read_json(backend, rel, entry)
+        except (OSError, ValueError, TypeError):
             log.debug("Skipping bad session file %s", rel, exc_info=True)
+            continue
+        if not isinstance(data, dict):
             continue
         sid = data.get("sessionId")
         nm = data.get("name")

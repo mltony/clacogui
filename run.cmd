@@ -91,19 +91,9 @@ REM Record the new hash so the next launch can skip the install step.
 REM ---------------------------------------------------------------------------
 REM 5) Launch the app.
 REM
-REM The FTP server runs inside WSL, but WSL exposes its listening ports to
-REM Windows localhost. Therefore we do not need to discover the WSL VM IP.
-REM
-REM Start the FTP server inside WSL with the SAME password stored in
-REM CLACOGUI_FTP_PASSWORD, for example:
-REM
-REM     python -m pyftpdlib -u ftpuser -P <password> ^
-REM         --range 60000-60009 -d / -w
-REM
-REM The server listens on:
-REM
-REM     localhost:2121          FTP control connection
-REM     localhost:60000-60009   passive FTP data connections
+REM Connect to the configured host's FTP port, including ports forwarded
+REM by that host into WSL. No guest-IP discovery is needed.
+REM Hidden-launcher profiles explicitly supply host, port, user and directories.
 REM
 REM You can still override the default target by passing a path or URL:
 REM
@@ -115,33 +105,47 @@ REM ---------------------------------------------------------------------------
 
 if not "%~1"=="" goto run_with_args
 
-REM Use Windows -> WSL localhost forwarding instead of resolving the
-REM changing WSL virtual-machine IP address.
-set "FTP_HOST=localhost"
-
-REM CLACOGUI_FTP_PASSWORD should normally be supplied by run_hidden.vbs
-REM or another environment variable.
-if not defined CLACOGUI_FTP_PASSWORD set "CLACOGUI_FTP_PASSWORD=changeme"
-
-REM Account/path inside WSL.
-if not defined CLACOGUI_WSL_HOME set "CLACOGUI_WSL_HOME=/home/%USERNAME%/.claude"
-
-REM Build the default Claude home FTP URL.
-set "DEFAULT_SPEC=ftp://ftpuser:%CLACOGUI_FTP_PASSWORD%@%FTP_HOST%:2121%CLACOGUI_WSL_HOME%"
-
-echo [clacogui] Using FTP backend at %FTP_HOST%:2121
-echo [clacogui] Claude home: %CLACOGUI_WSL_HOME%
-
-REM Optional Codex home over the same FTP server.
-if defined CLACOGUI_WSL_CODEX_HOME (
-    echo [clacogui] Codex home: %CLACOGUI_WSL_CODEX_HOME%
-
-    "%VENV_PY%" clacogui.py "%DEFAULT_SPEC%" ^
-        --codex "ftp://ftpuser:%CLACOGUI_FTP_PASSWORD%@%FTP_HOST%:2121%CLACOGUI_WSL_CODEX_HOME%"
-
-    exit /b %errorlevel%
+REM Defaults for direct run.cmd use; hidden profiles override all these.
+if not defined CLACOGUI_PROTOCOL set "CLACOGUI_PROTOCOL=ftp"
+if not defined CLACOGUI_HOST set "CLACOGUI_HOST=%CLACOGUI_FTP_HOST%"
+if not defined CLACOGUI_PORT set "CLACOGUI_PORT=%CLACOGUI_FTP_PORT%"
+if not defined CLACOGUI_USER set "CLACOGUI_USER=%CLACOGUI_FTP_USER%"
+if not defined CLACOGUI_HOST set "CLACOGUI_HOST=localhost"
+if /i "%CLACOGUI_PROTOCOL%"=="sftp" goto configure_sftp
+if /i not "%CLACOGUI_PROTOCOL%"=="ftp" (
+    echo [clacogui] ERROR: CLACOGUI_PROTOCOL must be ftp or sftp.
+    exit /b 1
 )
+if not defined CLACOGUI_PORT set "CLACOGUI_PORT=2121"
+if not defined CLACOGUI_USER set "CLACOGUI_USER=ftpuser"
+if not defined CLACOGUI_FTP_PASSWORD set "CLACOGUI_FTP_PASSWORD=changeme"
+set "REMOTE_BASE=ftp://%CLACOGUI_USER%:%CLACOGUI_FTP_PASSWORD%@%CLACOGUI_HOST%:%CLACOGUI_PORT%"
+goto configure_directories
 
+:configure_sftp
+if not defined CLACOGUI_PORT set "CLACOGUI_PORT=22"
+if not defined CLACOGUI_USER set "CLACOGUI_USER=%USERNAME%"
+set "REMOTE_BASE=sftp://%CLACOGUI_USER%@%CLACOGUI_HOST%:%CLACOGUI_PORT%"
+
+:configure_directories
+REM Accept the old directory variables for existing command-line setups.
+if not defined CLACOGUI_CLAUDE_DIR set "CLACOGUI_CLAUDE_DIR=%CLACOGUI_WSL_HOME%"
+if not defined CLACOGUI_CLAUDE_DIR set "CLACOGUI_CLAUDE_DIR=/home/%USERNAME%/.claude"
+if not defined CLACOGUI_CODEX_DIR set "CLACOGUI_CODEX_DIR=%CLACOGUI_WSL_CODEX_HOME%"
+
+set "DEFAULT_SPEC=%REMOTE_BASE%%CLACOGUI_CLAUDE_DIR%"
+
+echo [clacogui] Using %CLACOGUI_PROTOCOL% backend at %CLACOGUI_HOST%:%CLACOGUI_PORT%
+echo [clacogui] Claude directory: %CLACOGUI_CLAUDE_DIR%
+
+if not defined CLACOGUI_CODEX_DIR goto run_claude_only
+
+echo [clacogui] Codex directory: %CLACOGUI_CODEX_DIR%
+"%VENV_PY%" clacogui.py "%DEFAULT_SPEC%" ^
+    --codex "%REMOTE_BASE%%CLACOGUI_CODEX_DIR%"
+exit /b %errorlevel%
+
+:run_claude_only
 "%VENV_PY%" clacogui.py "%DEFAULT_SPEC%"
 exit /b %errorlevel%
 

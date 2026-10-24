@@ -1,12 +1,14 @@
 """Filesystem backends for clacogui.
 
-Two transports are supported:
+Supported transports:
 
 * :class:`LocalBackend` -- any local path, including drives mapped to an
   SMB share (e.g. ``X:\\.claude`` on Windows or ``/home/me/.claude`` on
   Unix).
 * :class:`FtpBackend`   -- a plain FTP URL such as
   ``ftp://ftpuser:<pw>@host:2121/home/me/.claude``.
+* :class:`sftp_backend.SftpBackend` -- SFTP over SSH with a verified host
+  key and an explicit private key, e.g. ``sftp://me@host/home/me/.claude``.
 
 The FTP path is the recommended workaround for aggressive Windows SMB
 client caching: ``ftplib`` issues a fresh transfer for every read, and
@@ -141,13 +143,16 @@ class FsBackend:
 def make_backend(spec: str) -> FsBackend:
     """Build a backend from a spec string.
 
-    ``ftp://...`` (or ``ftps://...``) URLs become :class:`FtpBackend`;
-    anything else is treated as a local path.
+    FTP and SFTP URLs select their respective remote backends; anything
+    else is treated as a local path.
     """
     spec = (spec or "").strip()
     lower = spec.lower()
     if lower.startswith("ftp://") or lower.startswith("ftps://"):
         return FtpBackend.from_url(spec)
+    if lower.startswith("sftp://"):
+        from sftp_backend import SftpBackend
+        return SftpBackend.from_url(spec)
     if not spec:
         raise ValueError("Empty backend spec")
     return LocalBackend(spec)
