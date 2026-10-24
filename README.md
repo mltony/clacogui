@@ -152,6 +152,8 @@ The window has a 3-field status bar.  Screen readers read fields
 left-to-right when navigating, so the most important indicator
 (*"is claude actually running?"*) sits in field 0:
 
+NVDA's status-bar command (`NVDA+End` with the desktop keyboard layout) reads the full field text, including text that does not fit visually. Long fields are clipped on screen rather than replaced with an ellipsis, and their tooltips retain the full text.
+
 | Field | Contents |
 | --- | --- |
 | 0 (leftmost) | `Claude: <status>` for the active tab &mdash; e.g. `Claude: idle`, `Claude: busy`, `Claude: not running`.  Source: `~/.claude/sessions/*.json` (the same files the launcher reads).  Empty when no tab is open or the conversation has no `session_id` yet. |

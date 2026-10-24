@@ -3380,7 +3380,19 @@ class MainFrame(wx.Frame):
         #              and shouldn't squelch the always-on claude
         #              status indicator.
         #   field 2 -- folder / backend description
-        self.CreateStatusBar(3)
+        # On Windows, wx replaces the native control's text with its
+        # ellipsized display text. MSAA (and NVDA+End) then returns that
+        # shortened string, even though GetStatusText() still has the full
+        # value. Let the native control clip visually and retain full text
+        # for accessibility and the existing overflow tooltips.
+        self.CreateStatusBar(
+            3,
+            style=wx.STB_DEFAULT_STYLE & ~(
+                wx.STB_ELLIPSIZE_START
+                | wx.STB_ELLIPSIZE_MIDDLE
+                | wx.STB_ELLIPSIZE_END
+            ),
+        )
         # Give the claude-status field a fixed width so the indicator
         # text ("Claude: busy") sits in a predictable place; the send
         # field gets a small share, and the folder gets the rest.
