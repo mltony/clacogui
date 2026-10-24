@@ -262,6 +262,8 @@ def parse_conversation(backend: FsBackend, rel_path: str) -> ConversationData:
     file doesn't break the whole conversation.
     """
     text = transcript_cache.read_text(backend, rel_path)
+    started = time.monotonic()
+    log.info("Transcript parse start: provider=claude path=%s chars=%d", rel_path, len(text))
 
     data = ConversationData()
     pending: Optional[Turn] = None
@@ -331,6 +333,8 @@ def parse_conversation(backend: FsBackend, rel_path: str) -> ConversationData:
         or (data.turns[0].preview(60) if data.turns else "")
         or posixpath.splitext(posixpath.basename(rel_path))[0]
     )
+    log.info("Transcript parse complete: provider=claude path=%s turns=%d parse=%.1fms",
+             rel_path, len(data.turns), (time.monotonic() - started) * 1000)
     return data
 
 

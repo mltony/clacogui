@@ -61,6 +61,30 @@ class TestMetadataCache(unittest.TestCase):
             metadata_cache.read_json(backend, "session.json", backend.entry)
         self.assertEqual(backend.reads, 2)
 
+    def test_stable_metadata_survives_a_scan_longer_than_two_seconds(self):
+        backend = Backend()
+        backend.entry.mtime = 100
+        with patch("metadata_cache.time.time", return_value=1000), patch("metadata_cache.time.monotonic", return_value=1):
+            metadata_cache.read_json(backend, "one.json", backend.entry)
+        with patch("metadata_cache.time.monotonic", return_value=12):
+            metadata_cache.read_json(backend, "one.json", backend.entry)
+        self.assertEqual(backend.reads, 1)
+        with patch("metadata_cache.time.monotonic", return_value=1 + metadata_cache.STABLE_MAX_AGE_SEC):
+            metadata_cache.read_json(backend, "one.json", backend.entry)
+        self.assertEqual(backend.reads, 2)
+
+    def test_recent_same_second_rewrite_is_confirmed_before_long_caching(self):
+        backend = Backend()
+        backend.entry.mtime = 100
+        with patch("metadata_cache.time.time", return_value=100.2), patch("metadata_cache.time.monotonic", return_value=1):
+            metadata_cache.read_json(backend, "one.json", backend.entry)
+        backend.text = backend.text.replace("busy", "idle")
+        with patch("metadata_cache.time.time", return_value=103), patch("metadata_cache.time.monotonic", return_value=4):
+            self.assertEqual(metadata_cache.read_json(backend, "one.json", backend.entry)["status"], "idle")
+        with patch("metadata_cache.time.monotonic", return_value=20):
+            self.assertEqual(metadata_cache.read_json(backend, "one.json", backend.entry)["status"], "idle")
+        self.assertEqual(backend.reads, 2)
+
     def test_deleted_and_recreated_file_does_not_reuse_old_data(self):
         backend = Backend()
         metadata_cache.read_json(backend, "sessions/one.json", backend.entry)

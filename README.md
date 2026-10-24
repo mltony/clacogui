@@ -6,6 +6,14 @@ and optionally **Codex CLI** ones side by side (see
 Built with `wxPython` + `wx.html2.WebView` so it works well with screen
 readers (NVDA, JAWS).
 
+Clacogui has its own Windows window/taskbar icon: a friendly robot with
+mint eyes and a pink antenna on an indigo rounded tile. The multi-size
+icon is `assets/clacogui.ico`, with an editable SVG and a PNG preview beside
+it. Close and restart all Clacogui windows after updating to see the icon.
+If an older Python shortcut is pinned, unpin it and pin the updated window
+again. Regenerate the artwork with `python tools/generate_icon.py`; Pillow
+is needed only for regeneration, not to run Clacogui.
+
 ## What it does
 
 - Reads `*.jsonl` conversation files under
@@ -108,8 +116,11 @@ just as they do for `run.cmd`.
 SFTP supports the same transcript polling, local transcript cache,
 notifications, permissions, and outgoing-message files as FTP, for both
 Claude and Codex. Each IO worker has its own persistent SSH/SFTP connection.
-Reads seek to the previous byte offset; large downloads use bounded
-prefetching. It connects directly to the SSH server; no FTP server is needed.
+Reads seek to the previous byte offset; large downloads use batches of
+16 requests of up to 32 KB each. This avoids a continuous-prefetch race
+that can leave downloaded data unused and make the remainder download
+again through slow sequential reads. It connects directly to the SSH
+server; no FTP server is needed.
 
 ```bat
 run.cmd sftp://me@host:22/home/me/.claude --codex sftp://me@host:22/home/me/.codex
@@ -176,9 +187,20 @@ python clacogui.py
 
 (`wxPython`, `markdown`, and `paramiko`. Python 3.10+ recommended.)
 
-Diagnostics go to `clacogui.log` in the same directory as `clacogui.py`.
-The log file is appended to on every run.
-Content-view (WebView) health is also written to `clacogui-webview.log`
+Each window/process writes its own logs under
+`%LOCALAPPDATA%\clacogui\logs` on Windows (or `~/.cache/clacogui/logs`
+otherwise). Keeping logs local also avoids writing them over SMB when the
+source checkout is on a share. Set `CLACOGUI_LOG_DIR` to choose another
+directory. Existing shared `clacogui.log` files are left untouched.
+
+File names include the launcher profile, machine, launch timestamp and PID,
+for example `clacogui-run_hidden_sftp-PC-20261024-160000-123456-1234.log`.
+The matching file ending in `-webview.log` contains content-view health.
+Every log line also identifies the process and worker thread. Main logs
+rotate at 10 MB and WebView logs at 5 MB, with three backups each. The
+existing launcher log contains the new runtime log's full path on startup.
+
+Content-view (WebView) health is also written to that process's WebView log
 (rotated at 5 MB): every 30 seconds clacogui checks each tab's Edge child
 windows and their processes, pings the current page, and logs any change;
 focus moves into the content view are logged too. A view whose Edge
@@ -277,10 +299,12 @@ the file is re-polled and the page is rebuilt.
 
 ## Threading
 
-Reads use three workers: one for the visible transcript, one for background
-tabs and session metadata, and one for user-initiated conversation-index
-scans. Writes use another worker, so sending a message never waits behind a
-transcript read. FTP/SFTP connections are private to each worker thread.
+Reads use four workers: one for the visible transcript, one for background
+tabs and session metadata, one for user-initiated conversation-index scans,
+and one for completion notifications. Writes use another worker, so sending
+a message never waits behind a transcript read. FTP/SFTP connections are
+private to each worker thread. Notification checks do not download metadata;
+permission requests still process fresh session state before being handled.
 
 - The active tab checks for appended records every 200 ms. Background tabs
   check at most once every 2 seconds. A queued background read is promoted
@@ -290,7 +314,10 @@ transcript read. FTP/SFTP connections are private to each worker thread.
   cache when available.
 - Session metadata JSON is cached by the directory listing's modification
   time and size. Changes invalidate it immediately. It is re-read after
-  2 seconds even with an unchanged signature, to handle coarse timestamps.
+  2 seconds for recently modified files, to handle coarse timestamps. Stable
+  files are revalidated after 60 seconds; a changed signature invalidates
+  either cache immediately. This avoids downloading every metadata file
+  again when a slow scan takes longer than two seconds.
 - Completion notifications request a refresh of that backend's open tabs,
   giving the visible tab priority. If a read is already running, another
   read follows it without overlapping transcript offsets. The sound still
@@ -300,12 +327,22 @@ Results return to the wx main thread through `wx.CallAfter`. Each panel
 keeps one normal read outstanding, with generation and byte-offset guards
 for late callbacks. Callbacks check whether their window still exists.
 
-To diagnose delays, `clacogui.log` includes `IO timing` entries when queue,
+To diagnose delays, each process's runtime log includes `IO timing` entries when queue,
 execution, UI dispatch or callback time reaches 250 ms. `FTP timing` and
 `Render timing` entries report operations taking at least 100 ms. Changed
 transcripts also log their read offset, byte count and read duration.
 Render timings measure Python rendering and WebView update calls, not the
 browser's eventual paint or a screen reader's response.
+
+SFTP transcript reads log their path, offset, remote size, phases, and byte
+counts. An independent monitor reports unfinished reads every 5 seconds.
+After 30 seconds without progress it records the blocked worker/prefetch
+thread stacks and prefetch request/buffer counts, repeating stacks at most
+once a minute. These reports continue even while the read is blocked.
+Stack reports include locations only, never local variables or transcript
+contents. Cache loading/validation/writing, parsing, and job queue/start/end
+records distinguish transfer stalls from local processing. Conversation
+alias records map names such as `d4` to their transcript paths.
 
 ## Opening conversations
 
@@ -334,7 +371,7 @@ bar narrates each phase:
    `Refreshed at HH:MM:SS - N message(s)`.
 3. After 5 seconds the bar reverts to the default shortcut hint.
 
-If a refresh is already running, an extra `F5` does **not** stack a
+If a refresh is already running, an extra `Ctrl+R` does **not** stack a
 duplicate request; it just shows `Refresh already in progress, please
 wait...` until the current one finishes. Screen readers re-announce the
 status bar whenever its text changes, so this round-trip is audible.

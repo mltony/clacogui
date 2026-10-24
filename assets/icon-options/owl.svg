@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<title>Clacogui: curious golden owl</title>
+<rect x="8" y="8" width="240" height="240" rx="52" fill="#172554"/>
+<polygon points="48,48 101,76 155,76 208,48 194,145 62,145" fill="#FBBF24"/>
+<ellipse cx="128.0" cy="148.0" rx="76.0" ry="76.0" fill="#FBBF24"/>
+<ellipse cx="94.5" cy="119.0" rx="35.5" ry="36.0" fill="#FFFBEB"/>
+<ellipse cx="161.5" cy="119.0" rx="35.5" ry="36.0" fill="#FFFBEB"/>
+<ellipse cx="96.0" cy="119.5" rx="13.0" ry="16.5" fill="#172554"/>
+<ellipse cx="160.0" cy="119.5" rx="13.0" ry="16.5" fill="#172554"/>
+<polygon points="128,142 143,155 128,170 113,155" fill="#EA580C"/>
+<ellipse cx="70.0" cy="180.0" rx="17.0" ry="25.0" fill="#F59E0B"/>
+<ellipse cx="186.0" cy="180.0" rx="17.0" ry="25.0" fill="#F59E0B"/>
+<polyline points="111,185 118,191 125,185" fill="none" stroke="#FFFBEB" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="135,185 142,191 149,185" fill="none" stroke="#FFFBEB" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

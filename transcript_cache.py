@@ -81,9 +81,16 @@ def read_text(backend: FsBackend, rel: str, encoding: str = "utf-8") -> str:
     if not backend.cache_transcripts:
         return backend.read_text(rel, encoding)
     path = _cache_path(backend, rel)
+    started = time.monotonic()
+    log.info("Cache read start: path=%s", backend.display_path(rel))
     with _lock_for(path):
+        log.info("Cache lock acquired: path=%s wait=%.1fms", rel,
+                 (time.monotonic() - started) * 1000)
+        loaded = time.monotonic()
         cached = _load(path)
         start = max(0, len(cached) - OVERLAP)
+        log.info("Cache loaded: path=%s bytes=%d load=%.1fms validate_offset=%d",
+                 rel, len(cached), (time.monotonic() - loaded) * 1000, start)
         fresh = backend.read_bytes_from(rel, start)
         overlap = len(cached) - start
         if cached and fresh[:overlap] == cached[start:]:
@@ -99,7 +106,10 @@ def read_text(backend: FsBackend, rel: str, encoding: str = "utf-8") -> str:
             if cached:
                 log.info("Transcript cache for %s no longer matches; downloading it again", rel)
             data = fresh if start == 0 else backend.read_bytes_from(rel, 0)
+            log.info("Cache write start: path=%s bytes=%d", rel, len(data))
             _replace(path, data)
+            log.info("Cache write complete: path=%s bytes=%d", rel, len(data))
+    log.info("Cache decode start: path=%s bytes=%d", rel, len(data))
     return data.decode(encoding, errors="replace")
 
 

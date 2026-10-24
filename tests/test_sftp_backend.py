@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -17,6 +18,7 @@ import paramiko
 
 import codex_models
 import clacogui_agent
+import diagnostics
 from fs import make_backend
 import gui
 import models
@@ -194,6 +196,47 @@ class TestSftpBackend(unittest.TestCase):
         entries = {entry.name: entry for entry in self.backend.list_dir("")}
         self.assertEqual(entries["session.jsonl"].size, len(prefix) + len(tail))
 
+    def test_large_download_does_not_abandon_prefetched_data_between_batches(self):
+        payload = b"0123456789abcdef" * (3 * 1024 * 1024 // 16) + b"last record\n"
+        (self.root / "large.jsonl").write_bytes(payload)
+        original = paramiko.SFTPFile._prefetch_thread
+        def delayed_batches(stream, chunks, maximum):
+            # Reproduce a temporarily empty request queue before a full-file
+            # prefetch has finished scheduling, as seen in the user's log.
+            for index in range(0, len(chunks), 16):
+                original(stream, chunks[index:index + 16], None)
+                deadline = time.monotonic() + 5
+                while stream._prefetch_extents and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                time.sleep(0.02)
+        with patch.object(paramiko.SFTPFile, "_prefetch_thread", delayed_batches):
+            self.assertEqual(self.backend.read_bytes_from("large.jsonl", 0), payload)
+        offsets = [offset for path, offset, _ in self.server.reads
+                   if path == "/large.jsonl" and offset < len(payload)]
+        self.assertEqual(len(offsets), len(set(offsets)), "Already prefetched blocks were downloaded again")
+        self.assertEqual(len(offsets), (len(payload) + 32767) // 32768)
+
+    def test_large_download_includes_data_appended_during_transfer(self):
+        payload = b"x" * (1024 * 1024)
+        path = self.root / "growing.jsonl"
+        path.write_bytes(payload)
+        original = LocalSftpServer.open
+        appended = threading.Event()
+        def open_growing(server, remote, flags, attrs):
+            handle = original(server, remote, flags, attrs)
+            if remote == "/growing.jsonl":
+                read = handle.read
+                def append_then_read(offset, size):
+                    if not appended.is_set():
+                        appended.set()
+                        with path.open("ab") as stream:
+                            stream.write(b"new record\n")
+                    return read(offset, size)
+                handle.read = append_then_read
+            return handle
+        with patch.object(LocalSftpServer, "open", open_growing):
+            self.assertEqual(self.backend.read_bytes_from("growing.jsonl", 0), payload + b"new record\n")
+
     def test_atomic_replacement_rename_and_directory_creation(self):
         self.backend.write_bytes("notifications/event.json", b"first")
         self.backend.write_bytes("notifications/event.json", b"second")
@@ -257,6 +300,45 @@ class TestSftpBackend(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "closed"):
             self.backend.list_dir("")
         self.assertEqual(self.backend._connections, [])
+
+    def test_blocked_sftp_read_reports_its_worker_stack_before_it_returns(self):
+        (self.root / "blocked.jsonl").write_bytes(b"test")
+        blocked, release = threading.Event(), threading.Event()
+        result, errors = [], []
+        original = LocalSftpServer.open
+        def open_blocked(server, path, flags, attrs):
+            handle = original(server, path, flags, attrs)
+            if path == "/blocked.jsonl":
+                read = handle.read
+                def wait_read(offset, size):
+                    blocked.set()
+                    release.wait(5)
+                    return read(offset, size)
+                handle.read = wait_read
+            return handle
+        def read():
+            try:
+                result.append(self.backend.read_bytes_from("blocked.jsonl", 0))
+            except Exception as error:
+                errors.append(error)
+        with patch.object(LocalSftpServer, "open", open_blocked):
+            worker = threading.Thread(target=read, name="blocked-read-test")
+            worker.start()
+            try:
+                self.assertTrue(blocked.wait(5))
+                with patch.object(diagnostics, "REPORT_SEC", 0), patch.object(diagnostics, "STALL_SEC", 0):
+                    with self.assertLogs("diagnostics", level="INFO") as logs:
+                        diagnostics.report_pending()
+                output = "\n".join(logs.output)
+                self.assertIn("Read stalled:", output)
+                self.assertIn("phase=reading", output)
+                self.assertIn("blocked-read-test", output)
+                self.assertIn("sftp_backend.py", output)
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(errors, errors)
+        self.assertEqual(result, [b"test"])
 
     def test_transport_failure_retries_once_but_permissions_do_not(self):
         operation = Mock(side_effect=[EOFError(), "recovered"])

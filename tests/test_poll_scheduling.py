@@ -132,6 +132,37 @@ class TestPollScheduling(unittest.TestCase):
 
 
 class TestCompletionDispatch(unittest.TestCase):
+    def test_notification_scan_does_not_read_session_metadata(self):
+        source = SimpleNamespace()
+        calls, jobs = [], []
+        source.list_dir = lambda directory: calls.append(directory) or []
+        frame = SimpleNamespace(
+            backend=source, codex_backend=None, _notification_inflight=None,
+            _notification_started=0, _handle_new_notifications=lambda *args: calls.append(args),
+        )
+        with patch.object(gui, "submit_io", side_effect=lambda fn, callback, **options: jobs.append((fn, callback, options))):
+            gui.MainFrame._poll_notifications(frame)
+        self.assertTrue(jobs[0][2]["notifications"])
+        result = jobs[0][0]()
+        jobs[0][1](result, None)
+        self.assertEqual(calls[0], gui.AGENT_NOTIFICATIONS_DIR)
+        self.assertEqual(calls[1], ([], source))
+        self.assertIsNone(frame._notification_inflight)
+
+    def test_notification_result_from_replaced_backend_is_discarded(self):
+        source = SimpleNamespace(list_dir=lambda directory: [])
+        delivered, jobs = [], []
+        frame = SimpleNamespace(
+            backend=source, codex_backend=None, _notification_inflight=None,
+            _notification_started=0, _handle_new_notifications=lambda *args: delivered.append(args),
+        )
+        with patch.object(gui, "submit_io", side_effect=lambda fn, callback, **options: jobs.append((fn, callback))):
+            gui.MainFrame._poll_notifications(frame)
+        frame.backend = object()
+        jobs[0][1](jobs[0][0](), None)
+        self.assertEqual(delivered, [])
+        self.assertIsNone(frame._notification_inflight)
+
     def test_refresh_active_matching_tab_first_and_isolate_other_backend(self):
         backend, other = object(), object()
         calls = []

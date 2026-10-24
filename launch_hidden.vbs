@@ -16,6 +16,7 @@ Sub LaunchHiddenConnection(protocol, host, port, user, password, keyFile, knownH
     Set shell = CreateObject("WScript.Shell")
     Set fso = CreateObject("Scripting.FileSystemObject")
     Set env = shell.Environment("Process")
+    env("CLACOGUI_LOG_PROFILE") = fso.GetBaseName(WScript.ScriptFullName)
 
     env("CLACOGUI_PROTOCOL") = protocol
     env("CLACOGUI_HOST") = host

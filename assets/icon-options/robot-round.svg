@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<title>Clacogui: round smiling robot</title>
+<rect x="8" y="8" width="240" height="240" rx="52" fill="#FFF1D6"/>
+<polyline points="128,75 128,44" fill="none" stroke="#334155" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+<ellipse cx="128.0" cy="37.0" rx="15.0" ry="15.0" fill="#F97316"/>
+<rect x="25" y="119" width="37" height="55" rx="15" fill="#60A5FA"/>
+<rect x="194" y="119" width="37" height="55" rx="15" fill="#60A5FA"/>
+<ellipse cx="128.0" cy="142.0" rx="83.0" ry="80.0" fill="#1E3A5F"/>
+<ellipse cx="128.0" cy="143.5" rx="66.0" ry="63.5" fill="#F8FAFC"/>
+<rect x="83" y="111" width="21" height="30" rx="10" fill="#1E3A5F"/>
+<rect x="152" y="111" width="21" height="30" rx="10" fill="#1E3A5F"/>
+<ellipse cx="84.5" cy="149.0" rx="11.5" ry="6.0" fill="#FDBA9D"/>
+<ellipse cx="171.5" cy="149.0" rx="11.5" ry="6.0" fill="#FDBA9D"/>
+<path d="M151.56400246295289 170.16367436568433 A26.0 20.5 0 0 1 104.4359975370471 170.16367436568433" fill="none" stroke="#1E3A5F" stroke-width="8"/>
+</svg>

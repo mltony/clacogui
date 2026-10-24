@@ -50,6 +50,14 @@ class TestReadWorkers(unittest.TestCase):
         self.deliver()
         self.assertEqual(received, ["index"])
 
+    def test_completion_scan_does_not_wait_for_slow_metadata(self):
+        self.block_background()
+        received = []
+        job = self.workers.submit(lambda: "Stop", lambda value, exc: received.append(value), notifications=True)
+        self.assertFalse(job.promote())
+        self.deliver()
+        self.assertEqual(received, ["Stop"])
+
     def test_promoted_job_runs_once_and_no_longer_blocks_background(self):
         self.block_background()
         executions, received = [], []

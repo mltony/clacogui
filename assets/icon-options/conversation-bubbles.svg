@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<title>Clacogui: two conversation bubbles</title>
+<rect x="8" y="8" width="240" height="240" rx="52" fill="#F3E8FF"/>
+<rect x="90" y="39" width="136" height="110" rx="30" fill="#7C3AED"/>
+<polygon points="173,136 220,169 214,132" fill="#7C3AED"/>
+<ellipse cx="124.5" cy="86.5" rx="7.5" ry="7.5" fill="#F5F3FF"/>
+<ellipse cx="157.5" cy="86.5" rx="7.5" ry="7.5" fill="#F5F3FF"/>
+<ellipse cx="190.5" cy="86.5" rx="7.5" ry="7.5" fill="#F5F3FF"/>
+<rect x="28" y="102" width="152" height="110" rx="31" fill="#0D9488"/>
+<polygon points="53,197 51,235 101,201" fill="#0D9488"/>
+<ellipse cx="65.0" cy="155.0" rx="8.0" ry="8.0" fill="#F0FDFA"/>
+<ellipse cx="102.0" cy="155.0" rx="8.0" ry="8.0" fill="#F0FDFA"/>
+<ellipse cx="139.0" cy="155.0" rx="8.0" ry="8.0" fill="#F0FDFA"/>
+</svg>

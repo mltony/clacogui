@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<title>Clacogui: friendly robot</title>
+<rect x="8" y="8" width="240" height="240" rx="52" fill="#4338CA"/>
+<polyline points="128,76 128,46" fill="none" stroke="#F8FAFC" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+<ellipse cx="128.0" cy="38.0" rx="14.0" ry="14.0" fill="#FB7185"/>
+<rect x="30" y="112" width="32" height="52" rx="12" fill="#5EEAD4"/>
+<rect x="194" y="112" width="32" height="52" rx="12" fill="#5EEAD4"/>
+<rect x="48" y="70" width="160" height="134" rx="34" fill="#F8FAFC"/>
+<rect x="64" y="90" width="128" height="92" rx="24" fill="#172554"/>
+<rect x="82" y="111" width="22" height="29" rx="11" fill="#5EEAD4"/>
+<rect x="152" y="111" width="22" height="29" rx="11" fill="#5EEAD4"/>
+<path d="M147.03246352776966 156.47320131872155 A21.0 16.5 0 0 1 108.96753647223035 156.47320131872155" fill="none" stroke="#5EEAD4" stroke-width="7"/>
+</svg>

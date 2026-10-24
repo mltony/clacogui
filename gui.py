@@ -322,13 +322,14 @@ from render import (
 
 log = logging.getLogger(__name__)
 # Separate logger so WebView health also lands in its own small file
-# (clacogui-webview.log, see clacogui.py).
+# (the process-specific WebView log, see clacogui.py).
 wvlog = logging.getLogger("webview")
 
 
 CONFIG_PATH = os.path.join(
     os.path.expanduser("~"), ".clacogui_config.json"
 )
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "clacogui.ico")
 
 POLL_INTERVAL_MS = 200
 BACKGROUND_POLL_INTERVAL_SEC = 2.0
@@ -344,8 +345,19 @@ PROVIDER_CLAUDE = "claude"
 PROVIDER_CODEX = "codex"
 
 
+def _set_window_icons(window: wx.TopLevelWindow) -> None:
+    """Supply native title-bar, Alt+Tab and taskbar icons at several sizes."""
+    try:
+        icons = wx.IconBundle(ICON_PATH, wx.BITMAP_TYPE_ICO)
+        if icons.IsEmpty():
+            raise ValueError("The Clacogui icon bundle is empty")
+        window.SetIcons(icons)
+    except Exception:
+        log.warning("Could not load Clacogui icon: %s", ICON_PATH, exc_info=True)
+
+
 def _set_window_appid(hwnd: int) -> None:
-    """Set per-window AppUserModelID + RelaunchDisplayName on Windows.
+    """Set the Windows application identity, display name and taskbar icon.
 
     NVDA reads the taskbar button's accessible name partly from the
     window's IPropertyStore.  Setting System.AppUserModel.ID and
@@ -356,6 +368,9 @@ def _set_window_appid(hwnd: int) -> None:
     """
     if not hwnd:
         return
+    co_initialized = False
+    release = None
+    pstore = None
     try:
         import ctypes
         import ctypes.wintypes as wt
@@ -384,10 +399,13 @@ def _set_window_appid(hwnd: int) -> None:
         IID_IPropertyStore = _guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")
 
         ole32 = ctypes.windll.ole32
-        ole32.CoInitialize(None)
+        co_initialized = ole32.CoInitialize(None) in (0, 1)
 
         pstore = ctypes.c_void_p()
-        hr = ctypes.windll.shell32.SHGetPropertyStoreForWindow(
+        get_store = ctypes.windll.shell32.SHGetPropertyStoreForWindow
+        get_store.argtypes = [wt.HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+        get_store.restype = ctypes.c_long
+        hr = get_store(
             hwnd, ctypes.byref(IID_IPropertyStore), ctypes.byref(pstore)
         )
         if hr != 0 or not pstore:
@@ -399,11 +417,11 @@ def _set_window_appid(hwnd: int) -> None:
         vt_ptr = ctypes.cast(pstore, ctypes.POINTER(ctypes.c_void_p))[0]
         VT = ctypes.cast(vt_ptr, ctypes.POINTER(ctypes.c_void_p * 8))[0]
 
-        SETVALUE = ctypes.CFUNCTYPE(
+        SETVALUE = ctypes.WINFUNCTYPE(
             ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
         )(VT[6])
-        COMMIT = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(VT[7])
-        RELEASE = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(VT[2])
+        COMMIT = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(VT[7])
+        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(VT[2])
 
         class PROPERTYKEY(ctypes.Structure):
             _fields_ = [("fmtid", GUID), ("pid", ctypes.c_ulong)]
@@ -415,21 +433,30 @@ def _set_window_appid(hwnd: int) -> None:
             key = PROPERTYKEY()
             key.fmtid = fmtid
             key.pid = pid
-            # PROPVARIANT: vt(2) + pad(6) + pointer(PTR_SIZE)
-            pv = (ctypes.c_byte * (8 + PTR_SIZE))()
+            # PROPVARIANT includes its full union: 24 bytes on Win64,
+            # 16 on Win32, even though VT_LPWSTR only uses one pointer.
+            pv = (ctypes.c_byte * (24 if PTR_SIZE == 8 else 16))()
             struct.pack_into("<H", pv, 0, 31)  # VT_LPWSTR
             wstr = ctypes.c_wchar_p(value)
             ptr_val = ctypes.cast(wstr, ctypes.c_void_p).value or 0
             fmt = "<Q" if PTR_SIZE == 8 else "<I"
             struct.pack_into(fmt, pv, 8, ptr_val)
-            SETVALUE(pstore, ctypes.byref(key), ctypes.byref(pv))
+            result = SETVALUE(pstore, ctypes.byref(key), ctypes.byref(pv))
+            if result < 0:
+                raise OSError(f"Setting taskbar property {pid} failed: {result:#x}")
 
-        _set_str(5, "clacogui.app.1")  # AppUserModel.ID
         _set_str(4, "clacogui")  # RelaunchDisplayNameResource
+        if os.path.isfile(ICON_PATH):
+            _set_str(3, ICON_PATH + ",0")  # RelaunchIconResource
+        _set_str(5, "clacogui.app.1")  # AppUserModel.ID
         COMMIT(pstore)
-        RELEASE(pstore)
     except Exception:
         log.debug("_set_window_appid failed", exc_info=True)
+    finally:
+        if release is not None and pstore:
+            release(pstore)
+        if co_initialized:
+            ole32.CoUninitialize()
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +517,7 @@ def _shutdown_io_thread() -> None:
 def submit_io(
     fn: Callable,
     on_done: Callable[[object, Optional[BaseException]], None],
-    *, foreground: bool = False, index: bool = False, label: Optional[str] = None,
+    *, foreground: bool = False, index: bool = False, notifications: bool = False, label: Optional[str] = None,
 ) -> io_jobs.ReadJob:
     """Read off the UI thread and deliver results through wx.CallAfter.
 
@@ -498,7 +525,7 @@ def submit_io(
     while waiting; work that has already started is never duplicated.
     Callbacks must check that their window still exists.
     """
-    return _read_workers.submit(fn, on_done, foreground=foreground, index=index, label=label)
+    return _read_workers.submit(fn, on_done, foreground=foreground, index=index, notifications=notifications, label=label)
 
 
 def submit_io_write(
@@ -1802,6 +1829,7 @@ class ConversationPanel(wx.Panel):
         if new == self._session_alias:
             return
         self._session_alias = new
+        log.info("Conversation alias: provider=%s path=%s alias=%r", self.provider, self.rel_path, new)
         self._notify_name_change()
 
     def selected_turn(self) -> Optional[Turn]:
@@ -2479,6 +2507,9 @@ class ConversationPanel(wx.Panel):
         if url == self._last_doc_url and self._last_inner_html is not None:
             if self._inject_inner_html(inner_html):
                 self._last_inner_html = inner_html
+                log.info("WebView DOM updated: provider=%s path=%s turn=%s response_chars=%d",
+                         self.provider, self.rel_path, turn.order if turn else None,
+                         len(turn.response) if turn else 0)
                 return
             # JS injection failed -- fall through to a full reload.
 
@@ -2503,6 +2534,9 @@ class ConversationPanel(wx.Panel):
             self.webview.SetPage(full, url)
             self._last_doc_url = url
             self._last_inner_html = inner_html
+            log.info("WebView page requested: provider=%s path=%s turn=%s response_chars=%d",
+                     self.provider, self.rel_path, turn.order if turn else None,
+                     len(turn.response) if turn else 0)
         except Exception:
             log.exception("WebView SetPage failed")
             self._last_doc_url = None
@@ -3345,6 +3379,7 @@ class MainFrame(wx.Frame):
             size=(1200, 800),
             name="ClacoGuiMain",
         )
+        _set_window_icons(self)
         if sys.platform == "win32":
             _set_window_appid(self.GetHandle())
         # Folders configured for this window that another clacogui already
@@ -3404,6 +3439,8 @@ class MainFrame(wx.Frame):
         self._active_poll_timer.Start(ACTIVE_POLL_INTERVAL_MS)
 
         # Agent (hook) monitoring state.
+        self._notification_inflight = None
+        self._notification_started = 0.0
         self._agent_polling = False
         # Watchdog + generation guard for the agent poll, mirroring
         # ``ConversationPanel.poll``.  If an agent-poll callback is ever lost,
@@ -4122,6 +4159,10 @@ class MainFrame(wx.Frame):
                 except Exception:
                     log.exception("Polling page %d crashed", i)
         try:
+            self._poll_notifications()
+        except Exception:
+            log.exception("Notification poll crashed")
+        try:
             self._poll_agent()
         except Exception:
             log.exception("Agent poll crashed")
@@ -4270,6 +4311,33 @@ class MainFrame(wx.Frame):
 
     # -- Agent (hook) monitoring -------------------------------------------
 
+    def _poll_notifications(self) -> None:
+        """Completion events never wait for status metadata or other tabs."""
+        now = time.monotonic()
+        if self._notification_inflight is not None:
+            if now - self._notification_started <= AGENT_POLL_WATCHDOG_SEC:
+                return
+            log.warning("Notification poll watchdog: superseding stalled scan")
+        sources = [backend for backend in (self.backend, self.codex_backend) if backend is not None]
+        if not sources:
+            return
+        token = object()
+        self._notification_inflight = token
+        self._notification_started = now
+        def work():
+            return [(backend, _safe_list_basenames(backend, AGENT_NOTIFICATIONS_DIR)) for backend in sources]
+        def callback(result, exc):
+            if not self or self._notification_inflight is not token:
+                return
+            self._notification_inflight = None
+            if exc is not None:
+                log.warning("Notification scan failed: %s", exc)
+                return
+            for backend, names in result:
+                if backend is self.backend or backend is self.codex_backend:
+                    self._handle_new_notifications(names, backend)
+        submit_io(work, callback, notifications=True, label="completion notifications")
+
     def _poll_agent(self) -> None:
         """Look for new notification/request/outgoing files under the backend root.
 
@@ -4335,7 +4403,7 @@ class MainFrame(wx.Frame):
                 _read_claude_session_state(backend)
             )
             return (
-                _safe_list_basenames(backend, AGENT_NOTIFICATIONS_DIR),
+                [],  # Notifications have their own worker.
                 _safe_list_basenames(backend, AGENT_REQUESTS_DIR),
                 outgoing,
                 claude_status_map,
@@ -4447,7 +4515,7 @@ class MainFrame(wx.Frame):
             if index_sig is not None and index_sig != prev_index_sig:
                 names = codex_models.load_session_names(backend)
             return (
-                _safe_list_basenames(backend, AGENT_NOTIFICATIONS_DIR),
+                [],  # Notifications have their own worker.
                 _safe_list_basenames(backend, AGENT_REQUESTS_DIR),
                 outgoing,
                 {sid: st.status for sid, st in states.items()},

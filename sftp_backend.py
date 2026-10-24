@@ -16,10 +16,13 @@ import uuid
 
 import paramiko
 
+from diagnostics import ReadTrace
 from fs import FsBackend, FsEntry
 
 log = logging.getLogger(__name__)
 TIMEOUT_SEC = 30
+READ_BLOCK_BYTES = 32768
+READ_BATCH_REQUESTS = 16
 
 
 class SftpBackend(FsBackend):
@@ -75,6 +78,8 @@ class SftpBackend(FsBackend):
             ssh.close()
 
     def _connect(self):
+        log.info("SFTP connect start: host=%s port=%d user=%s root=%s",
+                 self.host, self.port, self.user, self.root)
         if not os.path.isfile(self.key_filename):
             raise OSError(f"SSH key file not found: {self.key_filename}")
         ssh = paramiko.SSHClient()
@@ -90,6 +95,7 @@ class SftpBackend(FsBackend):
                 banner_timeout=TIMEOUT_SEC, auth_timeout=TIMEOUT_SEC,
             )
             ssh.get_transport().set_keepalive(30)
+            log.info("SFTP authenticated: host=%s; opening SFTP subsystem", self.host)
             sftp = ssh.open_sftp()
             sftp.get_channel().settimeout(TIMEOUT_SEC)
         except (paramiko.SSHException, OSError) as error:
@@ -176,14 +182,59 @@ class SftpBackend(FsBackend):
 
     def read_bytes_from(self, rel, offset):
         def work(sftp):
-            with sftp.open(self._full(rel), "rb") as stream:
-                stream.seek(max(0, offset))
-                size = stream.stat().st_size
-                if size is not None and size - offset > 65536:
-                    # Batch large first loads/reopens instead of waiting
-                    # for a network round trip for every small read.
-                    stream.prefetch(file_size=size, max_concurrent_requests=16)
-                return stream.read()
+            with ReadTrace(self.display_path(rel), offset) as trace:
+                with sftp.open(self._full(rel), "rb") as stream:
+                    trace.phase("stat")
+                    stream.seek(max(0, offset))
+                    size = stream.stat().st_size
+                    trace.expected = max(0, size - max(0, offset)) if size is not None else None
+                    trace.extra = lambda: {
+                        "prefetch_done": getattr(stream, "_prefetch_done", None),
+                        "pending_requests": len(getattr(stream, "_prefetch_extents", {})),
+                        "buffered_blocks": len(getattr(stream, "_prefetch_data", {})),
+                    }
+                    log.log(trace.level, "Read size: id=%s file_size=%s offset=%d expected=%s",
+                            trace.id, size, offset, trace.expected)
+                    data = bytearray()
+                    if trace.expected is not None and trace.expected > 65536:
+                        log.info("Read strategy: id=%s bounded batches requests=%d block_bytes=%d",
+                                 trace.id, READ_BATCH_REQUESTS, READ_BLOCK_BYTES)
+                        position = max(0, offset)
+                        short_read = False
+                        while position < size:
+                            trace.phase("reading batches")
+                            chunks = [(start, min(READ_BLOCK_BYTES, size - start))
+                                      for start in range(position, min(size, position + READ_BLOCK_BYTES * READ_BATCH_REQUESTS), READ_BLOCK_BYTES)]
+                            # Schedule only one small batch. A full-file
+                            # prefetch can mark itself done between request
+                            # batches and silently abandon its buffered data.
+                            blocks = stream.readv(chunks, max_concurrent_prefetch_requests=READ_BATCH_REQUESTS)
+                            for (_, requested), chunk in zip(chunks, blocks):
+                                data.extend(chunk)
+                                trace.advance(len(chunk))
+                                position += len(chunk)
+                                if len(chunk) != requested:
+                                    short_read = True  # File shrank while reading.
+                                    break
+                            if short_read:
+                                break
+                            if position >= size:
+                                # Preserve read-to-EOF behavior for transcripts
+                                # that were appended during the download.
+                                trace.phase("checking appended data")
+                                size = stream.stat().st_size or 0
+                                trace.expected = max(0, size - max(0, offset))
+                    else:
+                        trace.phase("reading")
+                        while True:
+                            chunk = stream.read(65536)
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                            trace.advance(len(chunk))
+                    trace.phase("closing")
+                trace.phase("assembling")
+                return bytes(data)
         return self._run(work)
 
     def mkdir(self, rel, exist_ok=True):

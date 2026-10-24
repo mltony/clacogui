@@ -196,11 +196,15 @@ def refresh_name(data: CodexConversationData, rel_path: str) -> None:
 def parse_conversation(backend: FsBackend, rel_path: str) -> CodexConversationData:
     """Parse a Codex rollout.  Raises :class:`OSError` on read failure."""
     text = transcript_cache.read_text(backend, rel_path)
+    started = time.monotonic()
+    log.info("Transcript parse start: provider=codex path=%s chars=%d", rel_path, len(text))
     data = CodexConversationData()
     consume_text(data, text)
     if data.session_id is None:
         data.session_id = thread_id_from_rel(rel_path)
     refresh_name(data, rel_path)
+    log.info("Transcript parse complete: provider=codex path=%s turns=%d parse=%.1fms",
+             rel_path, len(data.turns), (time.monotonic() - started) * 1000)
     return data
 
 
